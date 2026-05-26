@@ -1,0 +1,29 @@
+First we have to access the website and apply a filter.
+
+This must be done using a webdriver because you have to log in and click through pages, unless
+Claude figures out a better way.
+
+https://tap.dor.ms.gov/_/
+
+Then, after a certain sequence of clicks and applying the filter, the webdriver should click on each 
+order, export it, and apply the following sequence.
+
+Appending rows of ods to main xlsx database file
+
+What goes where:
+
+Column H ods -> Column D xlsx
+
+Columns A, B from ods -> Columns A, B xlsx
+
+Column C in xlsx is all "=VLOOKUP(A149,SizeData!A$1:B$3974,2,FALSE)", 
+but replace 149 with the row number of the current cell. So that would be the right
+value for cell C149
+
+The date and order number, columns E and F respectively, comes from order page.
+
+The last row in the ods should not be added.
+
+
+I also want to make this into a Github repo, so suggest a name for that and tell me the
+steps for that.

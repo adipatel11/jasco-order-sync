@@ -1,0 +1,12 @@
+.env
+cookies.pkl
+downloads/
+backups/
+logs/
+Practice Files/
+*.ods
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
