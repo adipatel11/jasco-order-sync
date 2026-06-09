@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd LaunchAgent for the daily TAP order sync.
+
+  Runs once a day at 00:00 (midnight). If the Mac is asleep at midnight, launchd
+  runs the missed job on the next wake. Because the script pulls *yesterday's*
+  orders, the exact run time doesn't matter.
+
+  DEPLOY (on the owner's Mac):
+    1. Replace every /Users/OWNER/PATH/TO/jasco-order-sync below with the real
+       absolute path to the cloned repo (run `pwd` inside it to get the path).
+    2. Copy this file to ~/Library/LaunchAgents/com.jasco.order-sync.plist
+    3. launchctl load ~/Library/LaunchAgents/com.jasco.order-sync.plist
+  See README "Deploying on the owner's Mac" for the full sequence.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jasco.order-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/OWNER/PATH/TO/jasco-order-sync/.venv/bin/python</string>
+        <string>/Users/OWNER/PATH/TO/jasco-order-sync/run.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/OWNER/PATH/TO/jasco-order-sync</string>
+
+    <!-- Scheduled runs are headless; manual `python run.py` stays visible because
+         load_dotenv won't override an env var launchd has already set. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HEADLESS</key>
+        <string>true</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>0</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/OWNER/PATH/TO/jasco-order-sync/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/OWNER/PATH/TO/jasco-order-sync/logs/launchd.err.log</string>
+</dict>
+</plist>

@@ -79,8 +79,17 @@ def _on_login_page(page: Page) -> bool:
         return False
 
 
-def login(page: Page, username: str, password: str) -> None:
-    """Username/password + first-time MFA. Pauses for the SMS code if prompted."""
+class MFARequiredError(RuntimeError):
+    """Raised when MFA is needed but no terminal is attached to complete it."""
+
+
+def login(page: Page, username: str, password: str, interactive: bool = True) -> None:
+    """Username/password + first-time MFA. Pauses for the SMS code if prompted.
+
+    When `interactive` is False (e.g. a scheduled launchd run with no terminal), an
+    MFA prompt raises MFARequiredError instead of hanging on input(), so the run
+    fails fast and the log tells you to re-authenticate manually.
+    """
     page.get_by_role("textbox", name="Username").fill(username)
     pw = page.get_by_role("textbox", name="Password")
     pw.fill(password)
@@ -92,6 +101,13 @@ def login(page: Page, username: str, password: str) -> None:
     except PWTimeout:
         log.info("No MFA prompt — device already trusted")
         return
+
+    if not interactive:
+        raise MFARequiredError(
+            "MFA is required but this run is unattended (no terminal). The trusted-"
+            "device cookie has likely expired. Run `python run.py` manually once to "
+            "re-establish trust, then scheduled runs will work again."
+        )
 
     print("\n=== MFA required ===")
     print("In the browser window:")
@@ -151,12 +167,12 @@ def _go_to_orders(page: Page) -> None:
     raise RuntimeError(f"Could not reach the Retail Orders list (url={page.url})")
 
 
-def load_or_login(page: Page, username: str, password: str) -> None:
+def load_or_login(page: Page, username: str, password: str, interactive: bool = True) -> None:
     """Ensure we end up on the Retail Orders list, logging in only if needed."""
     page.goto(TAP_URL, wait_until="domcontentloaded")
     if _on_login_page(page):
         log.info("No active session — performing login")
-        login(page, username, password)
+        login(page, username, password, interactive=interactive)
     else:
         log.info("Reusing saved browser profile session")
     _go_to_orders(page)

@@ -62,9 +62,12 @@ def main() -> int:
 
     clear_downloads()
 
+    # No terminal (e.g. a scheduled launchd run) → don't block on the MFA prompt.
+    interactive = sys.stdin.isatty()
+
     batches: list[OrderBatch] = []
     with chrome_session(DOWNLOADS, headless=headless) as page:
-        load_or_login(page, username, password)
+        load_or_login(page, username, password, interactive=interactive)
         apply_filter(page, target_date)
 
         for handle in iter_orders(page, DOWNLOADS):

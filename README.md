@@ -58,7 +58,56 @@ and skip MFA entirely.
 | `downloads/`      | Temp ODS landing zone (cleared each run)                          |
 | `logs/`           | Run logs                                                          |
 
-## Daily scheduling (optional, set up after manual run is clean)
+## Deploying on the owner's Mac
 
-Use macOS `launchd`. Create `~/Library/LaunchAgents/com.jasco.order-sync.plist`
-that calls `python /path/to/run.py` once daily, then `launchctl load` it.
+1. **Install Python** (3.11+): from [python.org](https://www.python.org/downloads/) or `brew install python`.
+2. **Clone and set up:**
+   ```bash
+   git clone https://github.com/adipatel11/jasco-order-sync.git
+   cd jasco-order-sync
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   playwright install chromium
+   ```
+3. **Configure `.env`:**
+   ```bash
+   cp .env.example .env
+   ```
+   Edit it with the owner's TAP credentials, `TAP_ACCOUNT_NAME` (if not
+   `ACME RETAIL LLC`), and `ORDER_XLSX_PATH` pointing at his OneDrive-synced
+   `Order.xlsx`. Leave `HEADLESS=false`.
+4. **First supervised run** (clears MFA once, establishes the trusted device):
+   ```bash
+   python run.py
+   ```
+   Complete MFA in the browser window, ticking **Trust this device**. Confirm it
+   appends to his file and writes a backup to `backups/`.
+
+## Daily scheduling (launchd, after the supervised run is clean)
+
+A LaunchAgent template lives at `launchd/com.jasco.order-sync.plist`. It runs the
+script headless at **midnight**; if the Mac is asleep, launchd runs the missed job
+on the next wake (fine, since it pulls *yesterday's* orders).
+
+```bash
+# from inside the repo:
+pwd     # copy this absolute path
+# edit launchd/com.jasco.order-sync.plist: replace every
+#   /Users/OWNER/PATH/TO/jasco-order-sync  with that path
+cp launchd/com.jasco.order-sync.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.jasco.order-sync.plist
+
+# test it immediately without waiting for midnight:
+launchctl start com.jasco.order-sync
+cat logs/launchd.err.log     # check for errors / MFARequiredError
+```
+
+To change later: `launchctl unload` the agent, edit, `launchctl load` again.
+
+**Notes**
+- The owner must be logged in for the agent to run (it drives a browser).
+- If a scheduled run ever logs `MFARequiredError`, the trusted-device cookie
+  expired — do one manual `python run.py` to re-establish it.
+- If the Mac is off/closed for a *full* calendar day, that day's run is skipped
+  (the script only ever fetches the single prior day).
