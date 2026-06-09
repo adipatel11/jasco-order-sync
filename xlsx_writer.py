@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import shutil
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,7 +14,25 @@ from ods_parser import OdsRow
 
 PENDING_SHEET = "Pending"
 FIRST_DATA_ROW = 4  # rows 1-3 are header/title/sum
-EXCEL_EPOCH = dt.date(1899, 12, 30)  # accounts for the 1900 leap year bug
+LAST_FORMAT_COL = 7  # copy formatting for columns A-G (G stays empty but needs borders)
+DATE_FORMAT = "m/d/yyyy"
+
+
+def _copy_row_format(ws, template_row: int, target_row: int) -> None:
+    """Replicate the cell formatting of template_row onto target_row (cols A-F).
+
+    Mirrors the owner's manual "format painter" step: take the last existing row's
+    look (font, fill, border, alignment, number format) and apply it to new rows.
+    """
+    for col in range(1, LAST_FORMAT_COL + 1):
+        src = ws.cell(row=template_row, column=col)
+        dst = ws.cell(row=target_row, column=col)
+        dst.font = copy(src.font)
+        dst.fill = copy(src.fill)
+        dst.border = copy(src.border)
+        dst.alignment = copy(src.alignment)
+        dst.protection = copy(src.protection)
+        dst.number_format = src.number_format
 
 
 @dataclass
@@ -20,10 +40,6 @@ class OrderBatch:
     order_number: str
     date: dt.date
     rows: list[OdsRow]
-
-
-def _excel_serial(d: dt.date) -> int:
-    return (d - EXCEL_EPOCH).days
 
 
 def _existing_order_numbers(ws) -> set[str]:
@@ -43,21 +59,27 @@ def _next_empty_row(ws) -> int:
 
 
 def write_orders(
-    source_xlsx: Path,
+    master_xlsx: Path,
     batches: list[OrderBatch],
     backups_dir: Path,
-) -> tuple[Path, int, int]:
-    """Append batches to a copy of source_xlsx. Returns (output_path, rows_added, orders_added).
+) -> tuple[Path | None, int, int]:
+    """Append batches to the master workbook IN PLACE.
+
+    Before overwriting, a pristine copy of the master is saved to backups_dir as a
+    restore point. Returns (backup_path, rows_added, orders_added); backup_path is
+    None when nothing was appended (master left untouched).
 
     Skips any batch whose order_number is already present in column E.
     """
-    wb = load_workbook(source_xlsx)
+    wb = load_workbook(master_xlsx)
     if PENDING_SHEET not in wb.sheetnames:
-        raise ValueError(f"{source_xlsx} has no '{PENDING_SHEET}' sheet")
+        raise ValueError(f"{master_xlsx} has no '{PENDING_SHEET}' sheet")
     ws = wb[PENDING_SHEET]
 
     seen = _existing_order_numbers(ws)
     next_row = _next_empty_row(ws)
+    # Template for formatting: the last existing data row. None if the sheet is empty.
+    template_row = next_row - 1 if next_row - 1 >= FIRST_DATA_ROW else None
 
     rows_added = 0
     orders_added = 0
@@ -66,7 +88,6 @@ def write_orders(
             continue
         if not batch.rows:
             continue
-        serial = _excel_serial(batch.date)
         for r in batch.rows:
             ws.cell(row=next_row, column=1, value=r.item_no)
             ws.cell(row=next_row, column=2, value=r.name)
@@ -77,14 +98,25 @@ def write_orders(
             )
             ws.cell(row=next_row, column=4, value=r.reserved_qty)
             ws.cell(row=next_row, column=5, value=batch.order_number)
-            ws.cell(row=next_row, column=6, value=serial)
+            ws.cell(row=next_row, column=6, value=batch.date)
+            if template_row is not None:
+                _copy_row_format(ws, template_row, next_row)
+            else:
+                ws.cell(row=next_row, column=6).number_format = DATE_FORMAT
             next_row += 1
             rows_added += 1
         seen.add(batch.order_number)
         orders_added += 1
 
+    if rows_added == 0:
+        # Nothing new — leave the master completely untouched (no backup, no save).
+        return None, 0, 0
+
+    # Save a pristine copy of the master BEFORE overwriting it, as a restore point.
     backups_dir.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    out_path = backups_dir / f"Order_{stamp}.xlsx"
-    wb.save(out_path)
-    return out_path, rows_added, orders_added
+    backup_path = backups_dir / f"{master_xlsx.stem}_backup_{stamp}{master_xlsx.suffix}"
+    shutil.copy2(master_xlsx, backup_path)
+
+    wb.save(master_xlsx)
+    return backup_path, rows_added, orders_added

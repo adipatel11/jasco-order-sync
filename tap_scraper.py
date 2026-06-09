@@ -1,55 +1,39 @@
-"""Drive the TAP website: log in, filter, iterate orders, export ODS.
+"""Drive the TAP website with Playwright: log in, filter, iterate orders, export ODS.
 
-Site-specific selectors live in the SELECTORS dict near the top of this file.
-They are best-guess placeholders — confirm and tweak them on the first live run
-by opening the site in Chrome devtools and matching against the actual DOM.
+Selectors here come from a real `playwright codegen` recording of the live site, so
+they use role/name locators (resilient to markup churn) rather than guessed CSS.
+
+A *persistent* browser profile is used (BROWSER_PROFILE dir). When you tick
+"Trust this device" during the first MFA, Chromium stores that cookie in the profile
+and reuses it on every later run — so MFA's text-message step only happens once.
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
-import pickle
+import os
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
+from playwright.sync_api import Download, Page, TimeoutError as PWTimeout, sync_playwright
 
 log = logging.getLogger(__name__)
 
 TAP_URL = "https://tap.dor.ms.gov/_/"
-COOKIES_FILE = Path("cookies.pkl")
+BROWSER_PROFILE = Path(".browser_profile")
 
-# --- SITE-SPECIFIC SELECTORS --------------------------------------------------
-# These are placeholders. Update on first live run.
-SELECTORS = {
-    "login_username": (By.ID, "Username"),
-    "login_password": (By.ID, "Password"),
-    "login_submit": (By.CSS_SELECTOR, "button[type='submit']"),
-    "mfa_trust_device": (By.XPATH, "//input[@type='checkbox' and contains(@id, 'trust')]"),
-    "mfa_submit": (By.CSS_SELECTOR, "button[type='submit']"),
-    # The "Submitted" date filter input on the orders list:
-    "submitted_filter": (By.CSS_SELECTOR, "input[name='submitted']"),
-    "filter_apply": (By.XPATH, "//button[contains(., 'Search') or contains(., 'Apply')]"),
-    # Each order row in the filtered list — link/anchor to detail page:
-    "order_row_links": (By.CSS_SELECTOR, "a.order-link, table tbody tr a"),
-    # On the order detail page:
-    "detail_order_number": (By.CSS_SELECTOR, "[data-field='orderNumber'], .order-number"),
-    "detail_export_button": (
-        By.XPATH,
-        "//a[contains(., 'Export')] | //button[contains(., 'Export')]",
-    ),
-}
-# -----------------------------------------------------------------------------
+# The business/account link shown after login (e.g. "ACME RETAIL LLC").
+# Override per machine via the TAP_ACCOUNT_NAME env var.
+ACCOUNT_NAME = os.environ.get("TAP_ACCOUNT_NAME", "ACME RETAIL LLC")
+
+# The detail page shows "<store> Retail Order - Order ID <value>". We read the value
+# that follows this label; the regexes below are loose fallbacks if that text moves.
+ORDER_ID_LABEL = "Order ID"
+ORDER_ID_AFTER_LABEL_RE = re.compile(r"Order ID\s*#?[:\s\-]*([A-Za-z0-9\-]+)")
+ORDER_NUMBER_RE = re.compile(r"[A-Z]\d{5,}")
 
 
 @dataclass
@@ -58,153 +42,354 @@ class OrderHandle:
     ods_path: Path
 
 
-def build_driver(downloads_dir: Path, headless: bool = False) -> webdriver.Chrome:
-    """Chrome with automatic ODS downloads into downloads_dir."""
+@contextmanager
+def chrome_session(downloads_dir: Path, headless: bool = False):
+    """Open a persistent-profile Chromium context. Yields a Page.
+
+    The persistent profile is what makes "Trust this device" stick across runs.
+    """
     downloads_dir.mkdir(parents=True, exist_ok=True)
-    opts = Options()
-    if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--window-size=1400,1000")
-    prefs = {
-        "download.default_directory": str(downloads_dir.resolve()),
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        "safebrowsing.enabled": True,
-    }
-    opts.add_experimental_option("prefs", prefs)
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=opts)
-
-
-def _save_cookies(driver: webdriver.Chrome) -> None:
-    with COOKIES_FILE.open("wb") as f:
-        pickle.dump(driver.get_cookies(), f)
-    log.info("Saved %d cookies to %s", len(driver.get_cookies()), COOKIES_FILE)
-
-
-def _load_cookies(driver: webdriver.Chrome) -> bool:
-    if not COOKIES_FILE.exists():
-        return False
-    driver.get(TAP_URL)
-    with COOKIES_FILE.open("rb") as f:
-        cookies = pickle.load(f)
-    for c in cookies:
-        # selenium rejects cookies with sameSite values it doesn't expect
-        c.pop("sameSite", None)
+    BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(BROWSER_PROFILE.resolve()),
+            headless=headless,
+            accept_downloads=True,
+            viewport={"width": 1400, "height": 1000},
+        )
+        page = context.pages[0] if context.pages else context.new_page()
         try:
-            driver.add_cookie(c)
-        except Exception as e:
-            log.debug("skip cookie %s: %s", c.get("name"), e)
-    driver.get(TAP_URL)
+            yield page
+        finally:
+            context.close()
+
+
+def _on_login_page(page: Page) -> bool:
+    """True if the login form renders (i.e. we are not authenticated).
+
+    TAP is a JS app, so the username field appears a beat after navigation. We poll
+    for it; if it never shows within the timeout, we're already logged in.
+    """
+    try:
+        page.get_by_role("textbox", name="Username").wait_for(
+            state="visible", timeout=15000
+        )
+        return True
+    except PWTimeout:
+        return False
+
+
+def login(page: Page, username: str, password: str) -> None:
+    """Username/password + first-time MFA. Pauses for the SMS code if prompted."""
+    page.get_by_role("textbox", name="Username").fill(username)
+    pw = page.get_by_role("textbox", name="Password")
+    pw.fill(password)
+    pw.press("Enter")
+
+    # If the device is already trusted, TAP skips straight past MFA.
+    try:
+        page.get_by_role("textbox", name="Security Code").wait_for(timeout=6000)
+    except PWTimeout:
+        log.info("No MFA prompt — device already trusted")
+        return
+
+    print("\n=== MFA required ===")
+    print("In the browser window:")
+    print("  1. Click 'Get a text message…' if needed and enter the Security Code.")
+    print("  2. Tick 'Trust this device'.")
+    print("  3. Click 'Log In'.")
+    input("Then press Enter here once you're logged in... ")
+
+
+def _filter_box(page: Page):
+    return page.get_by_role("textbox", name="Filter Retail Orders")
+
+
+def _orders_list_ready(page: Page, timeout: int = 3000) -> bool:
+    """True if the Retail Orders filter box is visible (we're on the list page)."""
+    try:
+        _filter_box(page).wait_for(state="visible", timeout=timeout)
+        return True
+    except PWTimeout:
+        return False
+
+
+def _go_to_orders(page: Page) -> None:
+    """Ensure we land on the Retail Orders list.
+
+    The post-login landing varies: sometimes the session restores us directly onto
+    the orders list, sometimes onto a dashboard where we must click the account then
+    "Add/View Retail Orders". So we check for the filter box at each step instead of
+    blindly clicking (which could navigate *away* from an already-loaded list).
+    """
+    for attempt in (1, 2, 3):
+        if _orders_list_ready(page):
+            return
+
+        acct = page.get_by_role("link", name=ACCOUNT_NAME)
+        if acct.count() > 0:
+            acct.first.click()
+            page.wait_for_load_state("networkidle")
+            log.info("Clicked account; now at %s", page.url)
+
+        orders = page.get_by_role("link", name="Add/View Retail Orders")
+        try:
+            orders.first.wait_for(state="visible", timeout=10000)
+            orders.first.click()
+            page.wait_for_load_state("networkidle")
+            log.info("Clicked Add/View Retail Orders; now at %s", page.url)
+        except PWTimeout:
+            log.warning("Add/View Retail Orders link not found (attempt %d, url=%s)",
+                        attempt, page.url)
+
+        if _orders_list_ready(page, timeout=15000):
+            return
+
+        log.warning("Orders list not ready (attempt %d, url=%s); resetting", attempt, page.url)
+        page.goto(TAP_URL, wait_until="domcontentloaded")
+
+    raise RuntimeError(f"Could not reach the Retail Orders list (url={page.url})")
+
+
+def load_or_login(page: Page, username: str, password: str) -> None:
+    """Ensure we end up on the Retail Orders list, logging in only if needed."""
+    page.goto(TAP_URL, wait_until="domcontentloaded")
+    if _on_login_page(page):
+        log.info("No active session — performing login")
+        login(page, username, password)
+    else:
+        log.info("Reusing saved browser profile session")
+    _go_to_orders(page)
+
+
+# Order View links live inside the grid cells (ids like "Dc-u-7"). Other "View" links
+# on the page (toolbar/sidebar) are NOT inside those cells, so scoping here excludes
+# them and leaves exactly one View link per order row.
+def _order_views(page: Page):
+    return page.locator("[id^='Dc-u-']").get_by_role("link", name="View")
+
+
+def _order_link_count(page: Page) -> int:
+    return _order_views(page).count()
+
+
+def _wait_orders_stable(page: Page, *, differ_from: int | None = None,
+                        timeout_ms: int = 20000) -> int:
+    """Poll the 'View'-link count until it stops changing.
+
+    The grid re-renders asynchronously after a filter/back-nav, so a single read can
+    catch the stale list. If `differ_from` is given, first wait for the count to move
+    off that value (the old list lingers for a moment after a filter is applied).
+    """
+    deadline = time.time() + timeout_ms / 1000
+    last: int | None = None
+    moved = differ_from is None
+    while time.time() < deadline:
+        n = _order_link_count(page)
+        if differ_from is not None and n != differ_from:
+            moved = True
+        if moved and n == last:
+            return n
+        last = n
+        page.wait_for_timeout(500)
+    return last if last is not None else 0
+
+
+def apply_filter(page: Page, target_date) -> None:
+    """Filter Retail Orders to yesterday's submitted reserve-inventory orders."""
+    date_str = target_date.strftime("%m-%d-%Y")
+    filter_text = f'submitted="{date_str}" AND status="reserve inventory"'
+    before = _order_link_count(page)
+    box = _filter_box(page)
+    box.click()
+    box.fill(filter_text)
+    box.press("Enter")
+    page.wait_for_load_state("networkidle")
+    n = _wait_orders_stable(page, differ_from=before)
+    log.info("Filter narrowed list from %d to %d orders (page 1)", before, n)
+
+
+# --- order list rows & pagination --------------------------------------------
+# Each order is a <tr class="TDR ...">. The order number sits in one cell and the
+# "View" link in another cell of the SAME row. The list reshuffles its row order
+# every time we enter and leave an order, so we always select by order number,
+# never by position.
+
+def _current_page_numbers(page: Page) -> list[str]:
+    """Order numbers (e.g. R3144144) visible on the current list page, in DOM order."""
+    rows = page.locator("tr.TDR")
+    numbers: list[str] = []
+    for i in range(rows.count()):
+        m = ORDER_NUMBER_RE.search(rows.nth(i).inner_text())
+        if m:
+            numbers.append(m.group(0))
+    return numbers
+
+
+def _click_order_view(page: Page, order_number: str) -> bool:
+    """Click the View link in the row whose order-number cell matches exactly."""
+    row = page.locator("tr.TDR").filter(
+        has=page.get_by_role("cell", name=order_number, exact=True)
+    )
+    link = row.get_by_role("link", name="View").first
+    if link.count() == 0:
+        return False
+    link.click()
     return True
 
 
-def _is_logged_in(driver: webdriver.Chrome) -> bool:
-    """Heuristic: if the login form isn't on the page, assume we're past it."""
-    try:
-        driver.find_element(*SELECTORS["login_username"])
+def _goto_next_page(page: Page) -> bool:
+    """Advance to the next list page. Returns False if there is no next page."""
+    nxt = page.get_by_role("link", name="Next")
+    if nxt.count() == 0:
         return False
-    except NoSuchElementException:
-        return True
-
-
-def login(driver: webdriver.Chrome, username: str, password: str) -> None:
-    """Fresh login flow. Prompts at the terminal for MFA confirmation."""
-    driver.get(TAP_URL)
-    wait = WebDriverWait(driver, 20)
-    wait.until(EC.visibility_of_element_located(SELECTORS["login_username"]))
-    driver.find_element(*SELECTORS["login_username"]).send_keys(username)
-    driver.find_element(*SELECTORS["login_password"]).send_keys(password)
-    driver.find_element(*SELECTORS["login_submit"]).click()
-
-    print("\n=== If MFA is shown in the browser, complete it now. ===")
-    print("=== Be sure to tick 'Trust this device' before submitting. ===")
-    input("Press Enter once you're past MFA and on the post-login page... ")
-    _save_cookies(driver)
-
-
-def load_or_login(driver: webdriver.Chrome, username: str, password: str) -> None:
-    if _load_cookies(driver) and _is_logged_in(driver):
-        log.info("Reusing saved session cookies")
-        return
-    log.info("No usable session, performing full login")
-    login(driver, username, password)
-
-
-def apply_filter(driver: webdriver.Chrome, target_date: dt.date) -> None:
-    """Set submitted=MM-DD-YYYY and apply."""
-    wait = WebDriverWait(driver, 20)
-    field = wait.until(EC.visibility_of_element_located(SELECTORS["submitted_filter"]))
-    field.clear()
-    field.send_keys(target_date.strftime("%m-%d-%Y"))
-    driver.find_element(*SELECTORS["filter_apply"]).click()
-    # Give the table a moment to refresh.
-    time.sleep(1.5)
-
-
-def _wait_for_ods(downloads_dir: Path, before: set[Path], timeout: float = 30.0) -> Path:
-    """Block until a new .ods file lands in downloads_dir, return its path."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        current = {p for p in downloads_dir.iterdir() if p.suffix.lower() == ".ods"}
-        # Ignore Chrome's partial-download placeholder .crdownload files via suffix check.
-        new = current - before
-        if new:
-            path = next(iter(new))
-            # wait for the size to stabilize (download fully flushed)
-            last_size = -1
-            for _ in range(20):
-                size = path.stat().st_size
-                if size > 0 and size == last_size:
-                    return path
-                last_size = size
-                time.sleep(0.25)
-            return path
-        time.sleep(0.5)
-    raise TimeoutException(f"No new ODS appeared in {downloads_dir} within {timeout}s")
-
-
-def iter_orders(driver: webdriver.Chrome, downloads_dir: Path):
-    """Yield OrderHandle for each order in the filtered list.
-
-    Each iteration:
-      1. clicks into the order detail page,
-      2. scrapes the order number,
-      3. triggers Export, waits for the ODS download,
-      4. navigates back to the list.
-    """
-    wait = WebDriverWait(driver, 20)
-    list_url = driver.current_url
-    # snapshot link count up-front; re-fetch by index since DOM changes after nav
-    links = driver.find_elements(*SELECTORS["order_row_links"])
-    n = len(links)
-    log.info("Filter matched %d orders", n)
-
-    for i in range(n):
-        driver.get(list_url)
-        links = driver.find_elements(*SELECTORS["order_row_links"])
-        if i >= len(links):
-            log.warning("Order list shrank between iterations at index %d", i)
-            break
-        links[i].click()
-
-        # scrape order number
-        order_el = wait.until(EC.visibility_of_element_located(SELECTORS["detail_order_number"]))
-        order_number = order_el.text.strip()
-
-        # trigger export
-        before = {p for p in downloads_dir.iterdir() if p.suffix.lower() == ".ods"}
-        export_btn = wait.until(EC.element_to_be_clickable(SELECTORS["detail_export_button"]))
-        export_btn.click()
-        ods_path = _wait_for_ods(downloads_dir, before)
-
-        yield OrderHandle(order_number=order_number, ods_path=ods_path)
-
-
-@contextmanager
-def chrome_session(downloads_dir: Path, headless: bool = False):
-    driver = build_driver(downloads_dir, headless=headless)
+    before = _current_page_numbers(page)
     try:
-        yield driver
+        nxt.first.click(timeout=5000)
+    except PWTimeout:
+        return False
+    page.wait_for_load_state("networkidle")
+    _wait_orders_stable(page)
+    return _current_page_numbers(page) != before
+
+
+def _goto_first_page(page: Page) -> None:
+    """Walk back to the first list page via the Prev link (no-op if single page)."""
+    for _ in range(100):  # safety bound
+        prev = page.get_by_role("link", name="Prev")
+        if prev.count() == 0:
+            return
+        before = _current_page_numbers(page)
+        try:
+            prev.first.click(timeout=5000)
+        except PWTimeout:
+            return
+        page.wait_for_load_state("networkidle")
+        _wait_orders_stable(page)
+        if _current_page_numbers(page) == before:
+            return
+
+
+def _extract_order_number(download: Download, page: Page) -> str:
+    """Order # from the 'Order ID' label on the detail page, with loose fallbacks."""
+    # 1. Preferred: the text that follows the "Order ID" label on the detail page.
+    try:
+        label = page.get_by_text(ORDER_ID_LABEL).first
+        container_text = label.locator("xpath=..").inner_text(timeout=2000)
+        log.debug("Order ID container text: %r", container_text)
+        m = ORDER_ID_AFTER_LABEL_RE.search(container_text)
+        if m:
+            return m.group(1).strip()
+    except PWTimeout:
+        pass
+    # 2. Fallbacks: the export filename, then the URL.
+    for source in (download.suggested_filename, page.url):
+        m = ORDER_NUMBER_RE.search(source or "")
+        if m:
+            return m.group(0)
+    # Last resort: the raw filename stem so nothing is silently lost.
+    return Path(download.suggested_filename).stem
+
+
+def _export_current_order(page: Page, downloads_dir: Path) -> OrderHandle:
+    """On an order detail page: click Export, save the ODS, read the order number.
+
+    The export is finicky: it may open a transient popup or download directly, the
+    download may attach to the popup rather than the main page, and the first click
+    can be a no-op if the detail page isn't fully interactive yet. So we capture
+    downloads from ANY page (main or popup) and retry the Export click.
+    """
+    context = page.context
+    captured: list[Download] = []
+    handlers: list = []
+
+    def _attach(p: Page) -> None:
+        handler = lambda d: captured.append(d)  # noqa: E731
+        p.on("download", handler)
+        handlers.append((p, handler))
+
+    _attach(page)
+    context.on("page", _attach)  # catch downloads that fire on a popup window
+    try:
+        export = page.get_by_role("link", name="Export")
+        export.first.wait_for(state="visible", timeout=15000)
+        for attempt in range(1, 4):
+            export.first.click()
+            deadline = time.time() + 12
+            while not captured and time.time() < deadline:
+                page.wait_for_timeout(200)
+            if captured:
+                break
+            log.warning("Export click %d produced no download; retrying", attempt)
+            page.wait_for_timeout(1000)
+        if not captured:
+            raise RuntimeError(f"Export produced no download (url={page.url})")
+        download = captured[0]
     finally:
-        driver.quit()
+        context.remove_listener("page", _attach)
+        for p, handler in handlers:
+            try:
+                p.remove_listener("download", handler)
+            except Exception:
+                pass
+
+    for other in list(context.pages):
+        if other is not page:
+            try:
+                other.close()
+            except Exception:
+                pass
+
+    order_number = _extract_order_number(download, page)
+    out_path = downloads_dir / f"{order_number}.ods"
+    download.save_as(out_path)
+    log.info(
+        "Order %s exported (file=%r url=%s)",
+        order_number, download.suggested_filename, page.url,
+    )
+    return OrderHandle(order_number=order_number, ods_path=out_path)
+
+
+def iter_orders(page: Page, downloads_dir: Path):
+    """Yield an OrderHandle per order across all pages of the filtered list.
+
+    The list reshuffles whenever we enter/leave an order, so we track processed
+    order numbers and always pick the next *unprocessed* one on the current page,
+    selecting it by number rather than position. When a page has no unprocessed
+    orders left, we advance to the next page.
+    """
+    _goto_first_page(page)
+    processed: set[str] = set()
+
+    while True:
+        numbers = _current_page_numbers(page)
+        todo = [n for n in numbers if n not in processed]
+
+        if todo:
+            number = todo[0]
+            if not _click_order_view(page, number):
+                log.warning("No View link for order %s; skipping", number)
+                processed.add(number)
+                continue
+            page.wait_for_load_state("networkidle")
+            # Confirm we actually landed on the order detail page (its "Go back to
+            # Request" link only exists there) before trying to export.
+            page.get_by_role("link", name="Go back to Request").wait_for(
+                state="visible", timeout=15000
+            )
+
+            handle = _export_current_order(page, downloads_dir)
+            processed.add(number)
+            processed.add(handle.order_number)  # in case list/detail labels differ
+            yield handle
+
+            page.get_by_role("link", name="Go back to Request").click()
+            page.wait_for_load_state("networkidle")
+            _wait_orders_stable(page)
+            continue
+
+        # Current page fully processed — try the next page.
+        if not _goto_next_page(page):
+            break
+
+    log.info("Processed %d orders total", len(processed - {""}))

@@ -6,9 +6,9 @@ sheet of `Order.xlsx`.
 
 ## What it does
 
-1. Logs into TAP (cookies persisted so MFA only triggers on first run after "trust device").
-2. Filters orders to `submitted = yesterday`.
-3. For each order: scrapes the order number, downloads the Export ODS.
+1. Logs into TAP (a persistent browser profile keeps the "Trust this device" cookie, so the MFA text-message step only happens on the first run).
+2. Opens the account's **Add/View Retail Orders** list and filters to `submitted = yesterday`.
+3. For each order: clicks View, clicks Export (a popup triggers the ODS download), and recovers the order number from the file/page.
 4. Appends rows to the `Pending` sheet of `Order.xlsx`:
    - `A` = Item # (from ODS col A)
    - `B` = Name (from ODS col B)
@@ -26,6 +26,7 @@ sheet of `Order.xlsx`.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+playwright install chromium
 
 cp .env.example .env
 # edit .env: TAP_USERNAME, TAP_PASSWORD, ORDER_XLSX_PATH
@@ -40,15 +41,17 @@ the owner's OneDrive-synced copy.
 python run.py
 ```
 
-First run will open Chrome, log in, prompt for MFA — click **Trust this device**.
-The script saves `cookies.pkl`; subsequent runs reuse the session.
+First run will open Chromium, log in, pause for MFA — click **Trust this device**
+in the browser, then press Enter in the terminal. The full browser profile is
+stored under `.browser_profile/`, so subsequent runs reuse the trust-device cookie
+and skip MFA entirely.
 
 ## Layout
 
 | File              | Role                                                              |
 | ----------------- | ----------------------------------------------------------------- |
 | `run.py`          | Entrypoint, orchestrates the full flow                            |
-| `tap_scraper.py`  | Selenium driver: login, filter, iterate orders, export            |
+| `tap_scraper.py`  | Playwright driver: login, filter, iterate orders, export          |
 | `ods_parser.py`   | Reads rows from an Export ODS, drops totals row                   |
 | `xlsx_writer.py`  | Loads `Order.xlsx`, appends to `Pending`, saves timestamped copy  |
 | `backups/`        | Output xlsx files                                                 |

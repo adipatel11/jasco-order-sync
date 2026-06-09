@@ -63,11 +63,11 @@ def main() -> int:
     clear_downloads()
 
     batches: list[OrderBatch] = []
-    with chrome_session(DOWNLOADS, headless=headless) as driver:
-        load_or_login(driver, username, password)
-        apply_filter(driver, target_date)
+    with chrome_session(DOWNLOADS, headless=headless) as page:
+        load_or_login(page, username, password)
+        apply_filter(page, target_date)
 
-        for handle in iter_orders(driver, DOWNLOADS):
+        for handle in iter_orders(page, DOWNLOADS):
             try:
                 rows = parse_ods(handle.ods_path)
             except Exception as e:
@@ -87,13 +87,22 @@ def main() -> int:
         log.info("No orders found for %s — nothing to do", target_date)
         return 0
 
-    out_path, rows_added, orders_added = write_orders(xlsx_path, batches, BACKUPS)
+    backup_path, rows_added, orders_added = write_orders(xlsx_path, batches, BACKUPS)
     skipped = len(batches) - orders_added
+    if rows_added == 0:
+        log.info(
+            "Nothing new for %s — master left untouched (%d duplicate orders skipped)",
+            target_date,
+            skipped,
+        )
+        return 0
     log.info(
-        "Wrote %s: %d orders, %d rows appended (%d duplicate orders skipped)",
-        out_path,
-        orders_added,
+        "Backed up master to %s; appended %d rows from %d orders into %s "
+        "(%d duplicate orders skipped)",
+        backup_path,
         rows_added,
+        orders_added,
+        xlsx_path,
         skipped,
     )
     return 0

@@ -1,5 +1,5 @@
 .env
-cookies.pkl
+.browser_profile/
 downloads/
 backups/
 logs/
@@ -10,3 +10,4 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+Master
