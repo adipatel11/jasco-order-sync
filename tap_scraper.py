@@ -211,8 +211,30 @@ def _wait_orders_stable(page: Page, *, differ_from: int | None = None,
     return last if last is not None else 0
 
 
-def apply_filter(page: Page, target_date) -> None:
-    """Filter Retail Orders to yesterday's submitted reserve-inventory orders."""
+def _wait_for_orders(page: Page, minimum: int, timeout_ms: int = 15000) -> bool:
+    """Wait until at least `minimum` order rows are rendered on the current page.
+
+    The grid re-renders in stages after a filter or a return-from-order, so a read taken
+    too early can see only some of the rows. Waiting for the known count keeps us from
+    mistaking a half-rendered list for a short one (which would silently drop orders).
+    """
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        if len(_current_page_numbers(page)) >= minimum:
+            return True
+        page.wait_for_timeout(300)
+    log.warning("Only %d/%d order rows rendered after %dms",
+                len(_current_page_numbers(page)), minimum, timeout_ms)
+    return False
+
+
+def apply_filter(page: Page, target_date) -> int:
+    """Filter Retail Orders to a day's submitted reserve-inventory orders.
+
+    Returns the stabilised order count on page 1 — the authoritative "how many orders
+    are there" number that callers pass back in so iteration/listing can wait for the
+    grid to fully render before trusting it.
+    """
     date_str = target_date.strftime("%m-%d-%Y")
     filter_text = f'submitted="{date_str}" AND status="reserve inventory"'
     before = _order_link_count(page)
@@ -223,6 +245,7 @@ def apply_filter(page: Page, target_date) -> None:
     page.wait_for_load_state("networkidle")
     n = _wait_orders_stable(page, differ_from=before)
     log.info("Filter narrowed list from %d to %d orders (page 1)", before, n)
+    return n
 
 
 # --- order list rows & pagination --------------------------------------------
@@ -284,6 +307,32 @@ def _goto_first_page(page: Page) -> None:
         _wait_orders_stable(page)
         if _current_page_numbers(page) == before:
             return
+
+
+def list_order_numbers(page: Page, expected_total: int | None = None) -> list[str]:
+    """Enumerate order numbers across all list pages WITHOUT entering/exporting them.
+
+    The interactive picker uses this to show the day's orders cheaply so the owner can
+    choose which to export — exporting every order just to pick a couple would be slow.
+    Reuses the same row scraping and pagination as iter_orders; order is preserved and
+    duplicates (a number that re-appears after the list reshuffles) are collapsed.
+
+    `expected_total` (the post-filter count from apply_filter) makes us wait for the grid
+    to finish rendering before scanning, so we never show a short list by mistake.
+    """
+    _goto_first_page(page)
+    if expected_total:
+        _wait_for_orders(page, expected_total)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    while True:
+        for n in _current_page_numbers(page):
+            if n not in seen:
+                seen.add(n)
+                ordered.append(n)
+        if not _goto_next_page(page):
+            break
+    return ordered
 
 
 def _extract_order_number(download: Download, page: Page) -> str:
@@ -366,46 +415,128 @@ def _export_current_order(page: Page, downloads_dir: Path) -> OrderHandle:
     return OrderHandle(order_number=order_number, ods_path=out_path)
 
 
-def iter_orders(page: Page, downloads_dir: Path):
-    """Yield an OrderHandle per order across all pages of the filtered list.
+def _on_order_detail(page: Page, timeout: int = 10000) -> bool:
+    """True once an order's detail page is up (its 'Go back to Request' link shows)."""
+    try:
+        page.get_by_role("link", name="Go back to Request").wait_for(
+            state="visible", timeout=timeout
+        )
+        return True
+    except PWTimeout:
+        return False
 
-    The list reshuffles whenever we enter/leave an order, so we track processed
-    order numbers and always pick the next *unprocessed* one on the current page,
-    selecting it by number rather than position. When a page has no unprocessed
-    orders left, we advance to the next page.
+
+def _return_to_list(page: Page) -> None:
+    """Best-effort: get back to the Retail Orders list from wherever we are.
+
+    Fast no-op when the list is already showing. If we're on an order detail page,
+    click its 'Go back to Request' link. Always settles the grid before returning, so
+    the next row read/click sees a stable list.
     """
-    _goto_first_page(page)
+    if _orders_list_ready(page, timeout=2000):
+        return
+    back = page.get_by_role("link", name="Go back to Request")
+    if back.count() > 0:
+        try:
+            back.first.click(timeout=5000)
+            page.wait_for_load_state("networkidle")
+        except PWTimeout:
+            pass
+    _wait_orders_stable(page)
+
+
+def _open_order_detail(page: Page, order_number: str, attempts: int = 3) -> bool:
+    """Click an order's View link and confirm its detail page loaded, retrying on miss.
+
+    The grid reshuffles every time we leave an order, and the live site occasionally
+    swallows a View click while the grid is still re-rendering — leaving us on the list
+    with no detail page. Rather than let a single timeout kill the whole run, we
+    re-settle the list and retry; the caller skips the order if we truly can't get in.
+    """
+    for attempt in range(1, attempts + 1):
+        _return_to_list(page)  # start each try from a settled list
+        if not _click_order_view(page, order_number):
+            log.warning("Order %s: no View link on the list (attempt %d, url=%s)",
+                        order_number, attempt, page.url)
+            continue
+        page.wait_for_load_state("networkidle")
+        if _on_order_detail(page):
+            return True
+        log.warning("Order %s: detail page didn't load (attempt %d, url=%s); retrying",
+                    order_number, attempt, page.url)
+    return False
+
+
+def iter_orders(page: Page, downloads_dir: Path, only: set[str] | None = None,
+                expected_total: int | None = None):
+    """Yield an OrderHandle per order on the filtered list.
+
+    Two quirks of the live site shape this:
+      * The grid reshuffles whenever we enter/leave an order, so we never select by
+        position — only by order number — re-locating each order from a fresh scan.
+      * The grid sometimes re-renders only *some* rows after we return from an order. A
+        naive "no rows left to do → finished" check then stops early and silently drops
+        orders. So we first snapshot the full set of order numbers to process (waiting
+        for the grid to reach `expected_total` rows), then loop until every one has been
+        handled — re-settling the list before each scan and giving up only after several
+        fruitless sweeps.
+
+    `only` restricts processing to those order numbers (the picker passes the owner's
+    selection). `expected_total` is the filtered count from apply_filter; it lets us wait
+    for a fully-rendered grid before trusting what's on it.
+    """
+    # Snapshot the authoritative set of orders to process.
+    if only is not None:
+        targets = set(only)
+        _goto_first_page(page)
+        if expected_total:
+            _wait_for_orders(page, expected_total)
+    else:
+        targets = set(list_order_numbers(page, expected_total=expected_total))
+    log.info("iter_orders: %d order(s) to process", len(targets))
+
     processed: set[str] = set()
+    stalls = 0
+    while targets - processed:
+        _goto_first_page(page)
+        if expected_total:
+            _wait_for_orders(page, expected_total)
 
-    while True:
-        numbers = _current_page_numbers(page)
-        todo = [n for n in numbers if n not in processed]
+        # Find an unprocessed target anywhere across the list pages.
+        number: str | None = None
+        while True:
+            here = [n for n in _current_page_numbers(page)
+                    if n in targets and n not in processed]
+            if here:
+                number = here[0]
+                break
+            if not _goto_next_page(page):
+                break
 
-        if todo:
-            number = todo[0]
-            if not _click_order_view(page, number):
-                log.warning("No View link for order %s; skipping", number)
-                processed.add(number)
-                continue
-            page.wait_for_load_state("networkidle")
-            # Confirm we actually landed on the order detail page (its "Go back to
-            # Request" link only exists there) before trying to export.
-            page.get_by_role("link", name="Go back to Request").wait_for(
-                state="visible", timeout=15000
-            )
+        if number is None:
+            # A full sweep found none of the remaining targets — likely a transient
+            # under-render. Retry a few times before accepting they're unreachable.
+            stalls += 1
+            if stalls >= 3:
+                log.error("Gave up locating orders on the list: %s",
+                          sorted(targets - processed))
+                break
+            log.warning("Sweep found no remaining target (stall %d/3); retrying", stalls)
+            continue
+        stalls = 0
 
-            handle = _export_current_order(page, downloads_dir)
+        # Enter the order's detail page, retrying the click if the flaky grid swallows
+        # it. If we still can't get in, skip this order rather than killing the run.
+        if not _open_order_detail(page, number):
+            log.error("Could not open order %s after retries; skipping it", number)
             processed.add(number)
-            processed.add(handle.order_number)  # in case list/detail labels differ
-            yield handle
-
-            page.get_by_role("link", name="Go back to Request").click()
-            page.wait_for_load_state("networkidle")
-            _wait_orders_stable(page)
+            _return_to_list(page)
             continue
 
-        # Current page fully processed — try the next page.
-        if not _goto_next_page(page):
-            break
+        handle = _export_current_order(page, downloads_dir)
+        processed.add(number)
+        processed.add(handle.order_number)  # in case list/detail labels differ
+        yield handle
+        _return_to_list(page)
 
-    log.info("Processed %d orders total", len(processed - {""}))
+    log.info("Processed %d of %d targeted order(s)", len(processed & targets), len(targets))

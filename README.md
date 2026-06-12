@@ -46,12 +46,45 @@ in the browser, then press Enter in the terminal. The full browser profile is
 stored under `.browser_profile/`, so subsequent runs reuse the trust-device cookie
 and skip MFA entirely.
 
+## Picking specific orders on demand (`pick.py`)
+
+The midnight job grabs *every* order from *yesterday*. When the owner instead wants to
+choose a **specific date** and hand-pick **which** orders to copy, run the picker:
+
+```bash
+python pick.py
+```
+
+Or, so the owner never has to touch a terminal, **double-click `Order Picker.command`**
+in Finder — it launches the same window. (First time only, macOS may ask to confirm
+opening it: right-click → **Open** → **Open**.)
+
+A window opens. Enter a date (or click **Yesterday** / **Today**), click **Fetch
+orders** — it lists that day's order numbers without downloading anything — tick the
+ones you want, then click **Copy selected → Excel**. Only the ticked orders are
+exported and appended to the same `Pending` sheet of `Order.xlsx`.
+
+It reuses the exact same scraper, parser, and writer as `run.py`, so the output format,
+backups, and `=VLOOKUP(...)` column are identical. Because the writer skips order
+numbers already in column E, picking an order the midnight job already captured is
+safe — it's simply skipped. The two tools never conflict.
+
+**Notes**
+- The picker shares the daily job's `.browser_profile`, so it needs no separate login.
+  If TAP asks for a fresh login (cookie expired), the window says so — do one
+  `python run.py` in a terminal to re-establish trust, then reopen the picker.
+- It drives the browser **headless** (no window pops up). Set `HEADLESS = False` at the
+  top of `pick.py` to watch it work while debugging.
+- Tkinter ships with the python.org installer. If you used Homebrew Python and get
+  `ModuleNotFoundError: No module named 'tkinter'`, install it with `brew install python-tk`.
+
 ## Layout
 
 | File              | Role                                                              |
 | ----------------- | ----------------------------------------------------------------- |
-| `run.py`          | Entrypoint, orchestrates the full flow                            |
-| `tap_scraper.py`  | Playwright driver: login, filter, iterate orders, export          |
+| `run.py`          | Daily entrypoint: yesterday → every order → append (unattended)   |
+| `pick.py`         | Interactive Tkinter picker: choose a date, pick which orders       |
+| `tap_scraper.py`  | Playwright driver: login, filter, list/iterate orders, export     |
 | `ods_parser.py`   | Reads rows from an Export ODS, drops totals row                   |
 | `xlsx_writer.py`  | Loads `Order.xlsx`, appends to `Pending`, saves timestamped copy  |
 | `backups/`        | Output xlsx files                                                 |

@@ -68,9 +68,9 @@ def main() -> int:
     batches: list[OrderBatch] = []
     with chrome_session(DOWNLOADS, headless=headless) as page:
         load_or_login(page, username, password, interactive=interactive)
-        apply_filter(page, target_date)
+        expected = apply_filter(page, target_date)
 
-        for handle in iter_orders(page, DOWNLOADS):
+        for handle in iter_orders(page, DOWNLOADS, expected_total=expected):
             try:
                 rows = parse_ods(handle.ods_path)
             except Exception as e:
