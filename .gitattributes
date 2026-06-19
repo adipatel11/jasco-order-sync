@@ -1,0 +1,10 @@
+# Normalize text files and pin line endings for the two launchers.
+# This matters because the same repo is used on the owner's Mac AND a Windows PC.
+* text=auto
+
+# Windows cmd is happiest with CRLF; force it regardless of the OS that committed.
+*.bat text eol=crlf
+
+# bash launchers must stay LF or macOS won't run them.
+*.command text eol=lf
+*.sh       text eol=lf

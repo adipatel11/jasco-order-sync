@@ -135,10 +135,7 @@ class PickerApp:
         self.canvas.configure(yscrollcommand=scroll.set)
         self.canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-        self.canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: self.canvas.yview_scroll(int(-1 * (e.delta)), "units"),
-        )
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
         sel = ttk.Frame(self.root)
         sel.pack(fill="x", padx=10)
@@ -158,6 +155,19 @@ class PickerApp:
                   anchor="w").pack(fill="x", side="bottom")
 
     # --- small helpers ----------------------------------------------------
+    def _on_mousewheel(self, event) -> None:
+        """Scroll the order list one notch per wheel step on both OSes.
+
+        Tk reports wheel deltas differently per platform: Windows sends multiples of
+        ±120, while macOS sends small raw values. The darwin branch keeps the Mac's
+        original behavior unchanged; Windows divides by 120 so one notch ≈ one step
+        instead of a 120-line jump.
+        """
+        if sys.platform == "darwin":
+            self.canvas.yview_scroll(-event.delta, "units")
+        else:
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
     def _set_date(self, d: dt.date) -> None:
         self.date_var.set(d.strftime("%m-%d-%Y"))
 

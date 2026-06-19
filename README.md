@@ -55,9 +55,12 @@ choose a **specific date** and hand-pick **which** orders to copy, run the picke
 python pick.py
 ```
 
-Or, so the owner never has to touch a terminal, **double-click `Order Picker.command`**
-in Finder — it launches the same window. (First time only, macOS may ask to confirm
-opening it: right-click → **Open** → **Open**.)
+Or, so the owner never has to touch a terminal, **double-click the launcher** — it
+opens the same window:
+- **Mac:** `Order Picker.command` in Finder. (First time only, macOS may ask to
+  confirm opening it: right-click → **Open** → **Open**.)
+- **Windows:** `Order Picker.bat` in File Explorer. (First time only, SmartScreen
+  may warn — click **More info → Run anyway**.)
 
 A window opens. Enter a date (or click **Yesterday** / **Today**), click **Fetch
 orders** — it lists that day's order numbers without downloading anything — tick the
@@ -144,3 +147,51 @@ To change later: `launchctl unload` the agent, edit, `launchctl load` again.
   expired — do one manual `python run.py` to re-establish it.
 - If the Mac is off/closed for a *full* calendar day, that day's run is skipped
   (the script only ever fetches the single prior day).
+
+## Running the picker on the owner's Windows PC
+
+The daily unattended job (`run.py` + launchd) stays on the **Mac**. The Windows PC
+on-site only runs the on-demand **picker** (`pick.py`), launched by double-clicking
+`Order Picker.bat`. Set it up once:
+
+1. **Install Python** (3.11+) from [python.org](https://www.python.org/downloads/).
+   On the installer's first screen tick **"Add python.exe to PATH"**, and keep the
+   default **"tcl/tk and IDLE"** component checked (that's Tkinter — the picker needs it).
+2. **Clone and set up** (in PowerShell or Command Prompt, from where you want the repo):
+   ```bat
+   git clone https://github.com/adipatel11/jasco-order-sync.git
+   cd jasco-order-sync
+   python -m venv .venv
+   .venv\Scripts\activate
+   pip install -r requirements.txt
+   playwright install chromium
+   ```
+3. **Configure `.env`:** copy `.env.example` to `.env` and edit it with the owner's
+   TAP credentials, `TAP_ACCOUNT_NAME` (if not `ACME RETAIL LLC`), and
+   `ORDER_XLSX_PATH` pointing at his OneDrive-synced `Order.xlsx` — use the real
+   Windows path, e.g. `C:\Users\Owner\OneDrive\...\Order.xlsx`.
+   ```bat
+   copy .env.example .env
+   ```
+4. **Establish the trusted device once** (so the picker, which runs headless, never
+   hits MFA). The picker can't do MFA itself, so run the daily sync once from a
+   terminal to clear it:
+   ```bat
+   python run.py
+   ```
+   Complete the text-message code in the browser window, ticking **Trust this device**.
+   The cookie is saved under `.browser_profile\` and reused from then on.
+5. **Everyday use:** double-click **`Order Picker.bat`** — no terminal needed. Pick a
+   date, **Fetch orders**, tick the ones to copy, **Copy selected → Excel**.
+
+   To put it on the Desktop, double-click **`Create Desktop Shortcut.bat`** once — it
+   drops a **Jasco Order Picker** icon on the Desktop that launches the picker. (Or by
+   hand: right-click `Order Picker.bat` → **Send to → Desktop (create shortcut)**.)
+
+**Notes**
+- `Order Picker.bat` uses the repo's `.venv` automatically, so always keep the `.bat`
+  inside the repo folder (the Desktop *shortcut* is fine — it still points back here).
+- If the picker ever says TAP needs a fresh login, the trusted-device cookie expired —
+  redo step 4 (`python run.py`) once, then reopen the picker.
+- The Mac and Windows machines each keep their **own** `.browser_profile\` and `.env`
+  (both are git-ignored), so trusting one device never affects the other.
