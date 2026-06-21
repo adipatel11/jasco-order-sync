@@ -1,29 +1,133 @@
-# jasco-order-sync
+# Jasco Order Sync
 
-Automates the daily routine of pulling submitted orders from the Mississippi DOR
-Taxpayer Access Point (https://tap.dor.ms.gov/_/) and appending them to the **Pending**
-sheet of `Order.xlsx`.
+**Browser-automation tool that replaces a ~1-hour daily manual data-entry task with a one-command (or one-click) sync.**
 
-> Built for a small wholesale business to replace a ~1-hour daily manual data-entry
-> task with a one-command (or one-click) sync. Stack: Python, Playwright (headless
-> Chromium), openpyxl, Tkinter, and a launchd schedule. Credentials and business data
-> live only in a git-ignored `.env` / local files — nothing sensitive is committed.
+Every day, a small wholesale business had to log into the Mississippi Department of
+Revenue [Taxpayer Access Point](https://tap.dor.ms.gov/_/) (TAP), open each of the
+previous day's submitted retail orders one by one, export it, and hand-copy the line
+items into a master Excel workbook. This tool does the whole thing end to end — and
+because it dedupes and backs up on every write, it's safe to run unattended on a
+schedule.
+
+> **Impact:** ~60 minutes of daily manual copying → ~2 minutes (≈1 hour saved per day).
+> Runs fully unattended after a one-time login.
+
+**Stack:** Python · Playwright (headless Chromium) · openpyxl · Tkinter · launchd · ODS/XLSX
+
+---
 
 ## What it does
 
-1. Logs into TAP (a persistent browser profile keeps the "Trust this device" cookie, so the MFA text-message step only happens on the first run).
-2. Opens the account's **Add/View Retail Orders** list and filters to `submitted = yesterday`.
-3. For each order: clicks View, clicks Export (a popup triggers the ODS download), and recovers the order number from the file/page.
-4. Appends rows to the `Pending` sheet of `Order.xlsx`:
-   - `A` = Item # (from ODS col A)
-   - `B` = Name (from ODS col B)
-   - `C` = `=VLOOKUP(A{row},SizeData!A$1:B$3974,2,FALSE)`
-   - `D` = Reserved Quantity (from ODS col H)
-   - `E` = Order # (scraped from order page)
-   - `F` = Date (yesterday, as Excel serial)
-5. Writes a timestamped copy to `backups/Order_YYYY-MM-DD_HHMMSS.xlsx`. The source
-   xlsx is never overwritten.
-6. Skips orders whose order # is already present in column E (idempotent).
+1. **Logs into TAP.** A *persistent* browser profile stores the "Trust this device"
+   cookie, so the SMS-MFA step only happens on the **first** run — every run after is
+   credential-free and unattended.
+2. **Filters the order list** to a single day's submitted reserve-inventory orders.
+3. **Walks every matching order:** opens it, clicks Export (which fires an `.ods`
+   download via a popup), and recovers the order number from the detail page.
+4. **Appends the line items** to the `Pending` sheet of `Order.xlsx`, matching the
+   exact layout the owner maintained by hand:
+
+   | Col | Value | Source |
+   | --- | ----- | ------ |
+   | `A` | Item # | ODS col A |
+   | `B` | Name | ODS col B |
+   | `C` | `=VLOOKUP(A{row},SizeData!A$1:B$3974,2,FALSE)` | generated formula |
+   | `D` | Reserved Quantity | ODS col H |
+   | `E` | Order # | scraped from the order page |
+   | `F` | Date | the target day, as an Excel date |
+
+5. **Backs up first, never clobbers.** A timestamped copy of the workbook is written to
+   `backups/` before any in-place save; if nothing new came in, the workbook is left
+   untouched.
+6. **Idempotent.** Orders whose number is already in column `E` are skipped, so re-runs
+   (or overlap between the scheduled job and the manual picker) can never double-enter.
+
+## How it works
+
+```
+          ┌─────────────┐      ┌──────────────┐      ┌──────────────┐
+ run.py ─▶│ tap_scraper  │ ───▶ │  ods_parser  │ ───▶ │  xlsx_writer │ ──▶ Order.xlsx
+ pick.py  │ (Playwright) │ .ods │ (rows, no    │ rows │ (append,     │     + backups/
+          │  login/      │      │  totals row) │      │  dedupe,     │
+          │  filter/     │      └──────────────┘      │  back up)    │
+          │  iterate/    │                            └──────────────┘
+          │  export)     │
+          └─────────────┘
+```
+
+Both entry points (`run.py` and `pick.py`) share the **same** scraper, parser, and
+writer, so their output — formatting, backups, the `VLOOKUP` column, the dedupe rule —
+is byte-for-byte identical. The only difference is *which* orders they feed in.
+
+## Engineering highlights
+
+The hard part isn't clicking buttons — it's that TAP is a single-page JavaScript app
+with a grid that re-renders asynchronously and **reshuffles its row order every time you
+enter and leave an order.** Most of the code exists to make automation against that
+reliable enough to trust unattended:
+
+- **Select by identity, never by position.** The order grid reorders itself constantly,
+  so every order is re-located by its order number on a fresh scan rather than by row
+  index — eliminating the classic "clicked the wrong row after a re-render" bug.
+- **Wait for *stable* state, not just *a* state.** The grid renders in stages, so a read
+  taken too early sees a half-populated list. The scraper polls the row count until it
+  stops changing (and until it reaches the known post-filter total) before trusting
+  what's on screen — otherwise it would silently drop orders.
+- **Guaranteed completeness.** It snapshots the full set of order numbers to process,
+  then loops until every one is handled, paginating across list pages and retrying. It
+  only gives up after several consecutive empty sweeps, and logs exactly which orders
+  (if any) it couldn't reach — so a run is never quietly incomplete.
+- **Resilient to flaky clicks.** The live site occasionally swallows a click while the
+  grid is still settling; View and Export clicks are retried, and the export download is
+  captured from **any** page — including the transient popup window TAP sometimes opens
+  it in.
+- **Resilient selectors.** Locators are role/name-based (recorded from `playwright
+  codegen` against the live site) rather than brittle CSS/XPath, so ordinary markup
+  churn doesn't break them.
+- **Unattended-safe MFA.** The persistent profile makes MFA one-time. If the trust
+  cookie ever expires, an unattended run detects that there's no terminal attached
+  (`sys.stdin.isatty()`) and raises a clear `MFARequiredError` instead of hanging
+  forever on an input prompt — the log tells you exactly how to re-establish trust.
+- **Non-destructive by construction.** The writer copies the previous row's cell
+  formatting onto new rows (replacing a manual "format painter" step), dedupes against
+  existing order numbers, and snapshots a backup before every in-place save.
+
+## Two ways to run
+
+| | `run.py` — the daily job | `pick.py` — the picker |
+| --- | --- | --- |
+| **When** | Scheduled, unattended (launchd, midnight) | On demand, by hand |
+| **Scope** | *Every* order from *yesterday* | A date *you* choose, *orders you tick* |
+| **UI** | None (headless) | Tkinter window + double-click launcher |
+| **For** | Set-and-forget automation | The non-technical owner, no terminal needed |
+
+The picker lists a day's order numbers **without** exporting anything (a cheap
+enumeration), so the owner can eyeball them and tick only the ones they want before any
+download happens. Because the writer is idempotent, picking an order the daily job
+already captured is a safe no-op.
+
+## Tech stack
+
+- **Python 3.11+**
+- **[Playwright](https://playwright.dev/python/)** — drives headless Chromium with a
+  persistent browser context (the key to one-time MFA)
+- **[openpyxl](https://openpyxl.readthedocs.io/)** — reads/writes the `.xlsx` workbook,
+  preserving styles and injecting formulas
+- **Tkinter** — the zero-dependency desktop GUI for the picker
+- **launchd** — macOS scheduling for the daily unattended run
+- **ODS parsing** — reads the spreadsheet TAP exports per order
+
+## Project layout
+
+| File | Role |
+| ---- | ---- |
+| `run.py` | Daily entrypoint: yesterday → every order → append (unattended) |
+| `pick.py` | Interactive Tkinter picker: choose a date, pick which orders |
+| `tap_scraper.py` | Playwright driver: login, filter, list/iterate orders, export |
+| `ods_parser.py` | Reads rows from an exported ODS, drops the totals row |
+| `xlsx_writer.py` | Appends to the `Pending` sheet, dedupes, saves a timestamped backup |
+| `launchd/` | LaunchAgent template for the daily schedule |
+| `backups/` `downloads/` `logs/` | Output, temp ODS landing zone, run logs (all git-ignored) |
 
 ## Setup
 
@@ -34,102 +138,28 @@ pip install -r requirements.txt
 playwright install chromium
 
 cp .env.example .env
-# edit .env: TAP_USERNAME, TAP_PASSWORD, ORDER_XLSX_PATH
+# edit .env: TAP_USERNAME, TAP_PASSWORD, TAP_ACCOUNT_NAME, ORDER_XLSX_PATH
 ```
 
-For dev, point `ORDER_XLSX_PATH` at `Practice Files/Order.xlsx`. For prod, point at
-the owner's OneDrive-synced copy.
-
-## Run
+Then run it:
 
 ```bash
-python run.py
+python run.py        # pulls yesterday's orders, appends, backs up
+python pick.py       # opens the interactive picker
 ```
 
-First run will open Chromium, log in, pause for MFA — click **Trust this device**
-in the browser, then press Enter in the terminal. The full browser profile is
-stored under `.browser_profile/`, so subsequent runs reuse the trust-device cookie
-and skip MFA entirely.
+The **first** run opens a real Chromium window and pauses for MFA — complete the SMS
+code and tick **Trust this device**, then press Enter. The browser profile is saved
+under `.browser_profile/`, so every later run skips login entirely.
 
-## Picking specific orders on demand (`pick.py`)
+## Deployment
 
-The midnight job grabs *every* order from *yesterday*. When the owner instead wants to
-choose a **specific date** and hand-pick **which** orders to copy, run the picker:
+<details>
+<summary><b>Daily unattended job on macOS (launchd)</b></summary>
 
-```bash
-python pick.py
-```
-
-Or, so the owner never has to touch a terminal, **double-click the launcher** — it
-opens the same window:
-- **Mac:** `Order Picker.command` in Finder. (First time only, macOS may ask to
-  confirm opening it: right-click → **Open** → **Open**.)
-- **Windows:** `Order Picker.bat` in File Explorer. (First time only, SmartScreen
-  may warn — click **More info → Run anyway**.)
-
-A window opens. Enter a date (or click **Yesterday** / **Today**), click **Fetch
-orders** — it lists that day's order numbers without downloading anything — tick the
-ones you want, then click **Copy selected → Excel**. Only the ticked orders are
-exported and appended to the same `Pending` sheet of `Order.xlsx`.
-
-It reuses the exact same scraper, parser, and writer as `run.py`, so the output format,
-backups, and `=VLOOKUP(...)` column are identical. Because the writer skips order
-numbers already in column E, picking an order the midnight job already captured is
-safe — it's simply skipped. The two tools never conflict.
-
-**Notes**
-- The picker shares the daily job's `.browser_profile`, so it needs no separate login.
-  If TAP asks for a fresh login (cookie expired), the window says so — do one
-  `python run.py` in a terminal to re-establish trust, then reopen the picker.
-- It drives the browser **headless** (no window pops up). Set `HEADLESS = False` at the
-  top of `pick.py` to watch it work while debugging.
-- Tkinter ships with the python.org installer. If you used Homebrew Python and get
-  `ModuleNotFoundError: No module named 'tkinter'`, install it with `brew install python-tk`.
-
-## Layout
-
-| File              | Role                                                              |
-| ----------------- | ----------------------------------------------------------------- |
-| `run.py`          | Daily entrypoint: yesterday → every order → append (unattended)   |
-| `pick.py`         | Interactive Tkinter picker: choose a date, pick which orders       |
-| `tap_scraper.py`  | Playwright driver: login, filter, list/iterate orders, export     |
-| `ods_parser.py`   | Reads rows from an Export ODS, drops totals row                   |
-| `xlsx_writer.py`  | Loads `Order.xlsx`, appends to `Pending`, saves timestamped copy  |
-| `backups/`        | Output xlsx files                                                 |
-| `downloads/`      | Temp ODS landing zone (cleared each run)                          |
-| `logs/`           | Run logs                                                          |
-
-## Deploying on the owner's Mac
-
-1. **Install Python** (3.11+): from [python.org](https://www.python.org/downloads/) or `brew install python`.
-2. **Clone and set up:**
-   ```bash
-   git clone https://github.com/adipatel11/jasco-order-sync.git
-   cd jasco-order-sync
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   playwright install chromium
-   ```
-3. **Configure `.env`:**
-   ```bash
-   cp .env.example .env
-   ```
-   Edit it with the user's TAP credentials, `TAP_ACCOUNT_NAME` (the business
-   account name shown after login), and `ORDER_XLSX_PATH` pointing at the OneDrive-synced
-   `Order.xlsx`. Leave `HEADLESS=false`.
-4. **First supervised run** (clears MFA once, establishes the trusted device):
-   ```bash
-   python run.py
-   ```
-   Complete MFA in the browser window, ticking **Trust this device**. Confirm it
-   appends to his file and writes a backup to `backups/`.
-
-## Daily scheduling (launchd, after the supervised run is clean)
-
-A LaunchAgent template lives at `launchd/com.jasco.order-sync.plist`. It runs the
-script headless at **midnight**; if the Mac is asleep, launchd runs the missed job
-on the next wake (fine, since it pulls *yesterday's* orders).
+A LaunchAgent template lives at `launchd/com.jasco.order-sync.plist`. It runs the script
+headless at **midnight**; if the Mac is asleep, launchd runs the missed job on the next
+wake (fine, since it always pulls *yesterday's* orders).
 
 ```bash
 # from inside the repo:
@@ -147,22 +177,24 @@ cat logs/launchd.err.log     # check for errors / MFARequiredError
 To change later: `launchctl unload` the agent, edit, `launchctl load` again.
 
 **Notes**
-- The owner must be logged in for the agent to run (it drives a browser).
-- If a scheduled run ever logs `MFARequiredError`, the trusted-device cookie
-  expired — do one manual `python run.py` to re-establish it.
-- If the Mac is off/closed for a *full* calendar day, that day's run is skipped
-  (the script only ever fetches the single prior day).
+- The user must be logged in for the agent to run (it drives a browser).
+- If a scheduled run logs `MFARequiredError`, the trusted-device cookie expired — do one
+  manual `python run.py` to re-establish it.
+- If the Mac is off for a full calendar day, that day's run is skipped (the script only
+  ever fetches the single prior day).
 
-## Running the picker on the owner's Windows PC
+</details>
 
-The daily unattended job (`run.py` + launchd) stays on the **Mac**. The Windows PC
-on-site only runs the on-demand **picker** (`pick.py`), launched by double-clicking
-`Order Picker.bat`. Set it up once:
+<details>
+<summary><b>Interactive picker on a Windows PC</b></summary>
 
-1. **Install Python** (3.11+) from [python.org](https://www.python.org/downloads/).
-   On the installer's first screen tick **"Add python.exe to PATH"**, and keep the
-   default **"tcl/tk and IDLE"** component checked (that's Tkinter — the picker needs it).
-2. **Clone and set up** (in PowerShell or Command Prompt, from where you want the repo):
+The daily unattended job stays on the Mac; a second machine can run just the on-demand
+picker, launched by double-clicking `Order Picker.bat`.
+
+1. **Install Python 3.11+** from [python.org](https://www.python.org/downloads/). On the
+   first installer screen tick **"Add python.exe to PATH"** and keep the default
+   **"tcl/tk and IDLE"** component (that's Tkinter — the picker needs it).
+2. **Clone and set up:**
    ```bat
    git clone https://github.com/adipatel11/jasco-order-sync.git
    cd jasco-order-sync
@@ -171,32 +203,28 @@ on-site only runs the on-demand **picker** (`pick.py`), launched by double-click
    pip install -r requirements.txt
    playwright install chromium
    ```
-3. **Configure `.env`:** copy `.env.example` to `.env` and edit it with the owner's
-   TAP credentials, `TAP_ACCOUNT_NAME` (the business account name shown after login), and
-   `ORDER_XLSX_PATH` pointing at his OneDrive-synced `Order.xlsx` — use the real
-   Windows path, e.g. `C:\Users\Owner\OneDrive\...\Order.xlsx`.
-   ```bat
-   copy .env.example .env
-   ```
-4. **Establish the trusted device once** (so the picker, which runs headless, never
-   hits MFA). The picker can't do MFA itself, so run the daily sync once from a
-   terminal to clear it:
-   ```bat
-   python run.py
-   ```
-   Complete the text-message code in the browser window, ticking **Trust this device**.
-   The cookie is saved under `.browser_profile\` and reused from then on.
+3. **Configure `.env`:** copy `.env.example` to `.env` and fill in the TAP credentials,
+   `TAP_ACCOUNT_NAME`, and `ORDER_XLSX_PATH` (use the real Windows path, e.g.
+   `C:\Users\Owner\OneDrive\...\Order.xlsx`).
+4. **Establish the trusted device once** — the picker runs headless and can't do MFA
+   itself, so run `python run.py` once from a terminal, complete the code, and tick
+   **Trust this device**.
 5. **Everyday use:** double-click **`Order Picker.bat`** — no terminal needed. Pick a
-   date, **Fetch orders**, tick the ones to copy, **Copy selected → Excel**.
+   date, **Fetch orders**, tick the ones to copy, **Copy selected → Excel**. Run
+   `Create Desktop Shortcut.bat` once to drop a launcher icon on the Desktop.
 
-   To put it on the Desktop, double-click **`Create Desktop Shortcut.bat`** once — it
-   drops a **Jasco Order Picker** icon on the Desktop that launches the picker. (Or by
-   hand: right-click `Order Picker.bat` → **Send to → Desktop (create shortcut)**.)
+Each machine keeps its **own** git-ignored `.browser_profile/` and `.env`, so trusting
+one device never affects the other.
 
-**Notes**
-- `Order Picker.bat` uses the repo's `.venv` automatically, so always keep the `.bat`
-  inside the repo folder (the Desktop *shortcut* is fine — it still points back here).
-- If the picker ever says TAP needs a fresh login, the trusted-device cookie expired —
-  redo step 4 (`python run.py`) once, then reopen the picker.
-- The Mac and Windows machines each keep their **own** `.browser_profile\` and `.env`
-  (both are git-ignored), so trusting one device never affects the other.
+</details>
+
+## A note on security & privacy
+
+This repo is deliberately clean of anything sensitive:
+
+- **Credentials never touch git.** TAP username/password and all paths live only in a
+  local `.env` (git-ignored, with a `.env.example` template).
+- **No business data is committed.** The live auth session (`.browser_profile/`),
+  downloaded orders, generated workbooks, and logs are all git-ignored.
+- **Account name is a placeholder.** `ACME RETAIL LLC` throughout is a stand-in for the
+  real account name, which is supplied per deployment via `TAP_ACCOUNT_NAME`.
