@@ -16,6 +16,12 @@ schedule.
 
 ---
 
+<p align="center">
+  <img src="docs/picker.png" alt="The interactive order picker" width="430">
+  <br>
+  <sub><i>The on-demand picker — choose a date, tick which orders to copy, one click to Excel. (Order numbers shown are placeholders.)</i></sub>
+</p>
+
 ## What it does
 
 1. **Logs into TAP.** A *persistent* browser profile stores the "Trust this device"
