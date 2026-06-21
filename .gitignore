@@ -11,3 +11,5 @@ __pycache__/
 venv/
 .DS_Store
 Master
+# Personal — never commit (contains name, phone, email, address)
+resume.md

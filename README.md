@@ -4,6 +4,11 @@ Automates the daily routine of pulling submitted orders from the Mississippi DOR
 Taxpayer Access Point (https://tap.dor.ms.gov/_/) and appending them to the **Pending**
 sheet of `Order.xlsx`.
 
+> Built for a small wholesale business to replace a ~1-hour daily manual data-entry
+> task with a one-command (or one-click) sync. Stack: Python, Playwright (headless
+> Chromium), openpyxl, Tkinter, and a launchd schedule. Credentials and business data
+> live only in a git-ignored `.env` / local files — nothing sensitive is committed.
+
 ## What it does
 
 1. Logs into TAP (a persistent browser profile keeps the "Trust this device" cookie, so the MFA text-message step only happens on the first run).
@@ -110,8 +115,8 @@ safe — it's simply skipped. The two tools never conflict.
    ```bash
    cp .env.example .env
    ```
-   Edit it with the owner's TAP credentials, `TAP_ACCOUNT_NAME` (if not
-   `ACME RETAIL LLC`), and `ORDER_XLSX_PATH` pointing at his OneDrive-synced
+   Edit it with the user's TAP credentials, `TAP_ACCOUNT_NAME` (the business
+   account name shown after login), and `ORDER_XLSX_PATH` pointing at the OneDrive-synced
    `Order.xlsx`. Leave `HEADLESS=false`.
 4. **First supervised run** (clears MFA once, establishes the trusted device):
    ```bash
@@ -167,7 +172,7 @@ on-site only runs the on-demand **picker** (`pick.py`), launched by double-click
    playwright install chromium
    ```
 3. **Configure `.env`:** copy `.env.example` to `.env` and edit it with the owner's
-   TAP credentials, `TAP_ACCOUNT_NAME` (if not `ACME RETAIL LLC`), and
+   TAP credentials, `TAP_ACCOUNT_NAME` (the business account name shown after login), and
    `ORDER_XLSX_PATH` pointing at his OneDrive-synced `Order.xlsx` — use the real
    Windows path, e.g. `C:\Users\Owner\OneDrive\...\Order.xlsx`.
    ```bat

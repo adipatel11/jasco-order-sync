@@ -26,7 +26,7 @@ TAP_URL = "https://tap.dor.ms.gov/_/"
 BROWSER_PROFILE = Path(".browser_profile")
 
 # The business/account link shown after login (e.g. "ACME RETAIL LLC").
-# Override per machine via the TAP_ACCOUNT_NAME env var.
+# Set this per deployment via the TAP_ACCOUNT_NAME env var (see .env.example).
 ACCOUNT_NAME = os.environ.get("TAP_ACCOUNT_NAME", "ACME RETAIL LLC")
 
 # The detail page shows "<store> Retail Order - Order ID <value>". We read the value
