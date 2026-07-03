@@ -27,7 +27,13 @@ BROWSER_PROFILE = Path(".browser_profile")
 
 # The business/account link shown after login (e.g. "ACME RETAIL LLC").
 # Set this per deployment via the TAP_ACCOUNT_NAME env var (see .env.example).
-ACCOUNT_NAME = os.environ.get("TAP_ACCOUNT_NAME", "ACME RETAIL LLC")
+# Read lazily (not at import time): callers load .env inside main(), which runs
+# AFTER this module is imported, so binding it here would freeze in the default.
+DEFAULT_ACCOUNT_NAME = "ACME RETAIL LLC"
+
+
+def account_name() -> str:
+    return os.environ.get("TAP_ACCOUNT_NAME", DEFAULT_ACCOUNT_NAME)
 
 # The detail page shows "<store> Retail Order - Order ID <value>". We read the value
 # that follows this label; the regexes below are loose fallbacks if that text moves.
@@ -142,11 +148,19 @@ def _go_to_orders(page: Page) -> None:
         if _orders_list_ready(page):
             return
 
-        acct = page.get_by_role("link", name=ACCOUNT_NAME)
-        if acct.count() > 0:
+        # Wait for the account link to render before deciding it's absent: the
+        # dashboard paints it a beat after login, and count() reads instantly, so
+        # an eager check would skip a link that simply hasn't appeared yet.
+        name = account_name()
+        acct = page.get_by_role("link", name=name)
+        try:
+            acct.first.wait_for(state="visible", timeout=10000)
             acct.first.click()
             page.wait_for_load_state("networkidle")
-            log.info("Clicked account; now at %s", page.url)
+            log.info("Clicked account %r; now at %s", name, page.url)
+        except PWTimeout:
+            log.info("Account link %r not shown (attempt %d, url=%s)",
+                     name, attempt, page.url)
 
         orders = page.get_by_role("link", name="Add/View Retail Orders")
         try:
