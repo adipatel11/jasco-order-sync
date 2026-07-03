@@ -18,6 +18,7 @@ through a queue, so the window never freezes while TAP is being driven.
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 import logging
 import os
@@ -96,6 +97,8 @@ class PickerApp:
         self.busy = False
         self.fetched_date: dt.date | None = None
         self.check_vars: dict[str, tk.BooleanVar] = {}
+        self._cal_win: tk.Toplevel | None = None  # the open calendar popup, if any
+        self._cal_view = (dt.date.today().year, dt.date.today().month)
 
         root.title("Jasco Order Picker")
         root.geometry("440x560")
@@ -114,8 +117,12 @@ class PickerApp:
         self.date_var = tk.StringVar(value=yesterday.strftime("%m-%d-%Y"))
         self.date_entry = ttk.Entry(top, textvariable=self.date_var, width=12)
         self.date_entry.pack(side="left", padx=6)
+        # Our own calendar popup (a plain Toplevel of buttons) — tkcalendar's
+        # drop-down is unusable on macOS, so we roll a small reliable one.
+        self.cal_btn = ttk.Button(top, text="Pick…", width=6, command=self._open_calendar)
+        self.cal_btn.pack(side="left")
         ttk.Button(top, text="Yesterday",
-                   command=lambda: self._set_date(yesterday)).pack(side="left")
+                   command=lambda: self._set_date(yesterday)).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Today",
                    command=lambda: self._set_date(dt.date.today())).pack(side="left", padx=4)
 
@@ -178,6 +185,99 @@ class PickerApp:
     def _parse_date(self) -> dt.date:
         return dt.datetime.strptime(self.date_var.get().strip(), "%m-%d-%Y").date()
 
+    # --- calendar popup ---------------------------------------------------
+    # A self-contained month grid in a plain Toplevel. We deliberately avoid any
+    # focus grab (tkcalendar's grab is what wedges on macOS): the popup is just a
+    # window of buttons that closes when a day is clicked or the window is closed.
+    def _open_calendar(self) -> None:
+        if self.busy:
+            return
+        if self._cal_win is not None and self._cal_win.winfo_exists():
+            self._cal_win.lift()
+            return
+        try:
+            base = self._parse_date()
+        except ValueError:
+            base = dt.date.today()
+        self._cal_view = (base.year, base.month)
+
+        win = tk.Toplevel(self.root)
+        win.title("Pick a date")
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._close_calendar)
+        self._cal_win = win
+        self._render_calendar()
+
+        win.update_idletasks()
+        x = self.cal_btn.winfo_rootx()
+        y = self.cal_btn.winfo_rooty() + self.cal_btn.winfo_height() + 2
+        win.geometry(f"+{x}+{y}")
+
+    def _render_calendar(self) -> None:
+        win = self._cal_win
+        if win is None:
+            return
+        for child in win.winfo_children():
+            child.destroy()
+        year, month = self._cal_view
+
+        try:
+            selected = self._parse_date()
+        except ValueError:
+            selected = None
+
+        hdr = ttk.Frame(win)
+        hdr.pack(fill="x", padx=6, pady=6)
+        ttk.Button(hdr, text="◀", width=3,
+                   command=lambda: self._shift_month(-1)).pack(side="left")
+        ttk.Label(hdr, text=f"{calendar.month_name[month]} {year}",
+                  anchor="center").pack(side="left", expand=True, fill="x")
+        ttk.Button(hdr, text="▶", width=3,
+                   command=lambda: self._shift_month(1)).pack(side="left")
+
+        grid = ttk.Frame(win)
+        grid.pack(padx=6, pady=(0, 8))
+        for col, name in enumerate(("Su", "Mo", "Tu", "We", "Th", "Fr", "Sa")):
+            ttk.Label(grid, text=name, width=3, anchor="center").grid(
+                row=0, column=col, padx=1, pady=1)
+
+        # firstweekday=6 → weeks start on Sunday (US convention).
+        weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(year, month)
+        for r, week in enumerate(weeks, start=1):
+            for c, day in enumerate(week):
+                if day == 0:
+                    continue
+                d = dt.date(year, month, day)
+                btn = tk.Button(grid, text=str(day), width=2,
+                                relief=("sunken" if d == selected else "raised"),
+                                command=lambda dd=d: self._pick_day(dd))
+                if d == selected:
+                    btn.config(font=("TkDefaultFont", 0, "bold"))
+                btn.grid(row=r, column=c, padx=1, pady=1)
+
+    def _shift_month(self, delta: int) -> None:
+        year, month = self._cal_view
+        month += delta
+        if month < 1:
+            month, year = 12, year - 1
+        elif month > 12:
+            month, year = 1, year + 1
+        self._cal_view = (year, month)
+        self._render_calendar()
+
+    def _pick_day(self, d: dt.date) -> None:
+        self._set_date(d)
+        self._close_calendar()
+
+    def _close_calendar(self) -> None:
+        if self._cal_win is not None:
+            try:
+                self._cal_win.destroy()
+            except tk.TclError:
+                pass
+            self._cal_win = None
+
     def _clear_orders(self) -> None:
         for child in self.list_frame.winfo_children():
             child.destroy()
@@ -198,6 +298,9 @@ class PickerApp:
         ready = (not busy) and bool(self.check_vars)
         self.fetch_btn.config(state="disabled" if busy else "normal")
         self.date_entry.config(state="disabled" if busy else "normal")
+        self.cal_btn.config(state="disabled" if busy else "normal")
+        if busy:
+            self._close_calendar()
         for btn in (self.copy_btn, self.all_btn, self.none_btn):
             btn.config(state="normal" if ready else "disabled")
 
