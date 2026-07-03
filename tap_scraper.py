@@ -41,6 +41,14 @@ ORDER_ID_LABEL = "Order ID"
 ORDER_ID_AFTER_LABEL_RE = re.compile(r"Order ID\s*#?[:\s\-]*([A-Za-z0-9\-]+)")
 ORDER_NUMBER_RE = re.compile(r"[A-Z]\d{5,}")
 
+# A list row's action link is "View" for Reserve Inventory orders but "Invoice" for
+# Shipped ones. Both open the same order detail page (same Export), so we treat them
+# interchangeably when counting rows and when clicking into an order.
+ORDER_ACTION_RE = re.compile(r"^(View|Invoice)$")
+# The detail page's link back to the list reads "Go back to Request" for the View path;
+# the Invoice path may word it differently, so we match any "Go back to …".
+GO_BACK_RE = re.compile(r"^Go back to\b")
+
 
 @dataclass
 class OrderHandle:
@@ -192,20 +200,20 @@ def load_or_login(page: Page, username: str, password: str, interactive: bool = 
     _go_to_orders(page)
 
 
-# Order View links live inside the grid cells (ids like "Dc-u-7"). Other "View" links
-# on the page (toolbar/sidebar) are NOT inside those cells, so scoping here excludes
-# them and leaves exactly one View link per order row.
-def _order_views(page: Page):
-    return page.locator("[id^='Dc-u-']").get_by_role("link", name="View")
+# Order action links (View/Invoice) live inside the grid cells (ids like "Dc-u-7").
+# Other such links (toolbar/sidebar) are NOT inside those cells, so scoping here excludes
+# them and leaves exactly one action link per order row.
+def _order_action_links(page: Page):
+    return page.locator("[id^='Dc-u-']").get_by_role("link", name=ORDER_ACTION_RE)
 
 
 def _order_link_count(page: Page) -> int:
-    return _order_views(page).count()
+    return _order_action_links(page).count()
 
 
 def _wait_orders_stable(page: Page, *, differ_from: int | None = None,
                         timeout_ms: int = 20000) -> int:
-    """Poll the 'View'-link count until it stops changing.
+    """Poll the order action-link (View/Invoice) count until it stops changing.
 
     The grid re-renders asynchronously after a filter/back-nav, so a single read can
     catch the stale list. If `differ_from` is given, first wait for the count to move
@@ -243,14 +251,17 @@ def _wait_for_orders(page: Page, minimum: int, timeout_ms: int = 15000) -> bool:
 
 
 def apply_filter(page: Page, target_date) -> int:
-    """Filter Retail Orders to a day's submitted reserve-inventory orders.
+    """Filter Retail Orders to a day's submitted Reserve Inventory / Shipped orders.
 
     Returns the stabilised order count on page 1 — the authoritative "how many orders
     are there" number that callers pass back in so iteration/listing can wait for the
     grid to fully render before trusting it.
     """
     date_str = target_date.strftime("%m-%d-%Y")
-    filter_text = f'submitted="{date_str}" AND status="reserve inventory"'
+    filter_text = (
+        f'submitted="{date_str}" '
+        "AND (status='Reserve Inventory' OR status='Shipped')"
+    )
     before = _order_link_count(page)
     box = _filter_box(page)
     box.click()
@@ -264,9 +275,9 @@ def apply_filter(page: Page, target_date) -> int:
 
 # --- order list rows & pagination --------------------------------------------
 # Each order is a <tr class="TDR ...">. The order number sits in one cell and the
-# "View" link in another cell of the SAME row. The list reshuffles its row order
-# every time we enter and leave an order, so we always select by order number,
-# never by position.
+# action link (View for Reserve Inventory, Invoice for Shipped) in another cell of the
+# SAME row. The list reshuffles its row order every time we enter and leave an order, so
+# we always select by order number, never by position.
 
 def _current_page_numbers(page: Page) -> list[str]:
     """Order numbers (e.g. R3144144) visible on the current list page, in DOM order."""
@@ -279,12 +290,12 @@ def _current_page_numbers(page: Page) -> list[str]:
     return numbers
 
 
-def _click_order_view(page: Page, order_number: str) -> bool:
-    """Click the View link in the row whose order-number cell matches exactly."""
+def _click_order_action(page: Page, order_number: str) -> bool:
+    """Click the action link (View or Invoice) in the row whose order number matches."""
     row = page.locator("tr.TDR").filter(
         has=page.get_by_role("cell", name=order_number, exact=True)
     )
-    link = row.get_by_role("link", name="View").first
+    link = row.get_by_role("link", name=ORDER_ACTION_RE).first
     if link.count() == 0:
         return False
     link.click()
@@ -430,9 +441,13 @@ def _export_current_order(page: Page, downloads_dir: Path) -> OrderHandle:
 
 
 def _on_order_detail(page: Page, timeout: int = 10000) -> bool:
-    """True once an order's detail page is up (its 'Go back to Request' link shows)."""
+    """True once an order's detail page is up (its 'Go back to …' link shows).
+
+    Reserve Inventory orders label it 'Go back to Request'; the Invoice path may word it
+    differently, so we accept any 'Go back to …' link.
+    """
     try:
-        page.get_by_role("link", name="Go back to Request").wait_for(
+        page.get_by_role("link", name=GO_BACK_RE).first.wait_for(
             state="visible", timeout=timeout
         )
         return True
@@ -444,12 +459,13 @@ def _return_to_list(page: Page) -> None:
     """Best-effort: get back to the Retail Orders list from wherever we are.
 
     Fast no-op when the list is already showing. If we're on an order detail page,
-    click its 'Go back to Request' link. Always settles the grid before returning, so
-    the next row read/click sees a stable list.
+    click its 'Go back to …' link (Request for View orders, whatever the Invoice path
+    uses). Always settles the grid before returning, so the next row read/click sees a
+    stable list.
     """
     if _orders_list_ready(page, timeout=2000):
         return
-    back = page.get_by_role("link", name="Go back to Request")
+    back = page.get_by_role("link", name=GO_BACK_RE)
     if back.count() > 0:
         try:
             back.first.click(timeout=5000)
@@ -460,17 +476,17 @@ def _return_to_list(page: Page) -> None:
 
 
 def _open_order_detail(page: Page, order_number: str, attempts: int = 3) -> bool:
-    """Click an order's View link and confirm its detail page loaded, retrying on miss.
+    """Click an order's action link and confirm its detail page loaded, retrying on miss.
 
     The grid reshuffles every time we leave an order, and the live site occasionally
-    swallows a View click while the grid is still re-rendering — leaving us on the list
+    swallows the click while the grid is still re-rendering — leaving us on the list
     with no detail page. Rather than let a single timeout kill the whole run, we
     re-settle the list and retry; the caller skips the order if we truly can't get in.
     """
     for attempt in range(1, attempts + 1):
         _return_to_list(page)  # start each try from a settled list
-        if not _click_order_view(page, order_number):
-            log.warning("Order %s: no View link on the list (attempt %d, url=%s)",
+        if not _click_order_action(page, order_number):
+            log.warning("Order %s: no View/Invoice link on the list (attempt %d, url=%s)",
                         order_number, attempt, page.url)
             continue
         page.wait_for_load_state("networkidle")
