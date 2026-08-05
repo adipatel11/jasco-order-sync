@@ -1,0 +1,17 @@
+# Fires the nightly sync. Install alongside order-sync.service:
+#   systemctl enable --now order-sync.timer
+#   systemctl list-timers order-sync.timer
+
+[Unit]
+Description=Run the Jasco order sync nightly at midnight
+
+[Timer]
+# The VPS is on America/Chicago, so this is local midnight with no TZ juggling.
+# run.py targets "yesterday", so a 00:00 run picks up the day that just ended.
+OnCalendar=*-*-* 00:00:00
+# If the VPS was down at midnight, run once on the next boot rather than
+# silently skipping a day. A late run is fine — it still targets yesterday.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

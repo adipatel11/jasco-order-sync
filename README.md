@@ -12,7 +12,7 @@ schedule.
 > **Impact:** ~60 minutes of daily manual copying → ~2 minutes (≈1 hour saved per day).
 > Runs fully unattended after a one-time login.
 
-**Stack:** Python · Playwright (headless Chromium) · openpyxl · Tkinter · launchd · ODS/XLSX
+**Stack:** Python · Playwright (headless Chromium) · openpyxl · Tkinter · systemd · ODS/XLSX
 
 ---
 
@@ -97,12 +97,17 @@ reliable enough to trust unattended:
 - **Non-destructive by construction.** The writer copies the previous row's cell
   formatting onto new rows (replacing a manual "format painter" step), dedupes against
   existing order numbers, and snapshots a backup before every in-place save.
+- **Safe to co-locate with another bot on the same account.** On the server this job
+  shares one Chromium profile — and therefore one MFA trust cookie — with a sibling
+  always-on watcher. An `flock`-based mutex that both projects point at the *same* file
+  makes them mutually exclusive, and the systemd unit stops and restores the watcher
+  around each run, so a crashed or wedged sync can never leave it down.
 
 ## Two ways to run
 
 | | `run.py` — the daily job | `pick.py` — the picker |
 | --- | --- | --- |
-| **When** | Scheduled, unattended (launchd, midnight) | On demand, by hand |
+| **When** | Scheduled, unattended (systemd timer, midnight) | On demand, by hand |
 | **Scope** | *Every* order from *yesterday* | A date *you* choose, *orders you tick* |
 | **UI** | None (headless) | Tkinter window + double-click launcher |
 | **For** | Set-and-forget automation | The non-technical owner, no terminal needed |
@@ -120,7 +125,7 @@ already captured is a safe no-op.
 - **[openpyxl](https://openpyxl.readthedocs.io/)** — reads/writes the `.xlsx` workbook,
   preserving styles and injecting formulas
 - **Tkinter** — the zero-dependency desktop GUI for the picker
-- **launchd** — macOS scheduling for the daily unattended run
+- **systemd** (service + timer) — scheduling for the daily unattended run on a Linux VPS
 - **ODS parsing** — reads the spreadsheet TAP exports per order
 
 ## Project layout
@@ -132,7 +137,8 @@ already captured is a safe no-op.
 | `tap_scraper.py` | Playwright driver: login, filter, list/iterate orders, export |
 | `ods_parser.py` | Reads rows from an exported ODS, drops the totals row |
 | `xlsx_writer.py` | Appends to the `Pending` sheet, dedupes, saves a timestamped backup |
-| `launchd/` | LaunchAgent template for the daily schedule |
+| `telegram.py` | Optional success/failure ping for the unattended run |
+| `deploy/` | systemd service + timer for the daily schedule |
 | `backups/` `downloads/` `logs/` | Output, temp ODS landing zone, run logs (all git-ignored) |
 
 ## Setup
@@ -161,41 +167,70 @@ under `.browser_profile/`, so every later run skips login entirely.
 ## Deployment
 
 <details>
-<summary><b>Daily unattended job on macOS (launchd)</b></summary>
+<summary><b>Daily unattended job on a Linux VPS (systemd)</b></summary>
 
-A LaunchAgent template lives at `launchd/com.jasco.order-sync.plist`. It runs the script
-headless at **midnight**; if the Mac is asleep, launchd runs the missed job on the next
-wake (fine, since it always pulls *yesterday's* orders).
+The daily job runs on an always-on Ubuntu VPS rather than a desktop, so nothing depends
+on a laptop being awake and logged in. `deploy/` holds a `oneshot` service and the timer
+that fires it at local midnight.
 
 ```bash
-# from inside the repo:
-pwd     # copy this absolute path
-# edit launchd/com.jasco.order-sync.plist: replace every
-#   /Users/OWNER/PATH/TO/jasco-order-sync  with that path
-cp launchd/com.jasco.order-sync.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.jasco.order-sync.plist
+# as root, with the repo at /home/jasco/jasco-order-sync owned by user `jasco`:
+cp deploy/order-sync.service deploy/order-sync.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now order-sync.timer
 
-# test it immediately without waiting for midnight:
-launchctl start com.jasco.order-sync
-cat logs/launchd.err.log     # check for errors / MFARequiredError
+systemctl list-timers order-sync.timer   # confirm the next run
+systemctl start order-sync.service       # test now, without waiting for midnight
+journalctl -u order-sync.service -f
 ```
 
-To change later: `launchctl unload` the agent, edit, `launchctl load` again.
+Set the VPS timezone so "midnight" needs no juggling (`timedatectl set-timezone …`), and
+install Xvfb — the service runs Chromium under `xvfb-run`, because a fully headless
+browser announces itself differently and can re-trigger TAP's MFA.
+
+**Sharing one browser profile with another job.** This deployment sits beside a sibling
+always-on watcher that drives the *same* TAP account. They cannot overlap: TAP ties its
+session to a per-tab token, and two Chromium trees don't fit in 2 GB of RAM. Two
+mechanisms keep them apart:
+
+- The service **stops the watcher before the run and restarts it afterwards**, from
+  `ExecStopPost` so the watcher comes back on success, failure, *or* timeout. A
+  `TimeoutStartSec` bounds the whole thing, so a run wedged inside Playwright can't keep
+  the watcher down indefinitely.
+- Both projects point `TAP_LOCK` at **one** lock file, so `_lock()` in `run.py` is a
+  mutex across *both* codebases. Anything that starts while the other is live exits
+  immediately rather than corrupting the shared profile.
+
+That lets both share a single `.browser_profile` (a symlink) and therefore a single
+trusted-device cookie — one MFA bootstrap instead of two. It costs the watcher a few
+minutes of downtime a day.
 
 **Notes**
-- The user must be logged in for the agent to run (it drives a browser).
-- If a scheduled run logs `MFARequiredError`, the trusted-device cookie expired — do one
-  manual `python run.py` to re-establish it.
-- If the Mac is off for a full calendar day, that day's run is skipped (the script only
-  ever fetches the single prior day).
+- Pin Playwright to the **same version** both projects use. They share one
+  `~/.cache/ms-playwright`, and a different version wants a different Chromium build.
+- If a scheduled run logs `MFARequiredError`, the trusted-device cookie expired — run
+  `python run.py` manually once (with the other job stopped) to re-establish it.
+- Set `TG_BOT_TOKEN` / `TG_CHAT_ID` to get a Telegram ping on each append or crash;
+  there's no terminal to watch on a server.
+
+</details>
+
+<details>
+<summary><b>Previously: macOS (launchd)</b></summary>
+
+Before moving to the VPS, the daily job ran as a `launchd` LaunchAgent on the owner's
+Mac at midnight. That approach needed the Mac to be awake and logged in to run, and
+skipped any day the machine was off — which is what motivated the move. The LaunchAgent
+template was removed in the migration so it can't be loaded by accident and race the
+server against the same TAP account; `git log` has it if you want to see it.
 
 </details>
 
 <details>
 <summary><b>Interactive picker on a Windows PC</b></summary>
 
-The daily unattended job stays on the Mac; a second machine can run just the on-demand
-picker, launched by double-clicking `Order Picker.bat`.
+The daily unattended job stays on the server; a desktop machine can run just the
+on-demand picker, launched by double-clicking `Order Picker.bat`.
 
 1. **Install Python 3.11+** from [python.org](https://www.python.org/downloads/). On the
    first installer screen tick **"Add python.exe to PATH"** and keep the default

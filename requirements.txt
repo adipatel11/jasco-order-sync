@@ -1,3 +1,9 @@
-playwright>=1.44
+# Pinned, not >=: the VPS reuses the stock radar's already-downloaded Chromium
+# (chromium-1228) out of a shared ~/.cache/ms-playwright. A newer Playwright
+# expects a different build and would re-download one, so both projects must
+# agree on this version.
+playwright==1.61.0
 openpyxl>=3.1
 python-dotenv>=1.0
+# Used only by telegram.py, for the unattended VPS run's success/failure ping.
+requests>=2.31

@@ -9,6 +9,11 @@ import shutil
 import sys
 from pathlib import Path
 
+try:
+    import fcntl  # Unix only; the Windows picker machine has no fcntl (see _lock)
+except ImportError:
+    fcntl = None
+
 from dotenv import load_dotenv
 
 from ods_parser import parse_ods
@@ -39,6 +44,42 @@ def clear_downloads() -> None:
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
 
 
+def notify(text: str) -> None:
+    """Best-effort Telegram ping. A silent no-op unless TG_* is configured.
+
+    An unattended VPS run has nobody watching the terminal, so a failure that only
+    lands in a log file is a failure nobody hears about. Imported lazily so the Mac
+    and the Windows picker, which don't configure Telegram, never need `requests`.
+    """
+    log = logging.getLogger("run")
+    if not (os.environ.get("TG_BOT_TOKEN") and os.environ.get("TG_CHAT_ID")):
+        return
+    try:
+        import telegram
+
+        telegram.send(text)
+    except Exception:
+        log.exception("Could not send the Telegram status message")
+
+
+def _lock():
+    """Take the single-instance lock, or return None if someone else holds it.
+
+    Two processes driving one Chromium profile corrupt it. On the VPS TAP_LOCK
+    points at the stock radar's own lock file, so the two projects share a single
+    mutex over the shared browser profile and can never run at the same time.
+    Holding the open fd is what holds the flock; it's released when we exit.
+    """
+    if fcntl is None:  # Windows: only the picker runs there, never concurrently
+        return open(ROOT / ".lock", "w")
+    lock_fd = open(Path(os.environ.get("TAP_LOCK", ROOT / ".lock")), "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None
+    return lock_fd
+
+
 def main() -> int:
     load_dotenv(ROOT / ".env")
     setup_logging()
@@ -56,6 +97,14 @@ def main() -> int:
     if not xlsx_path.exists():
         log.error("ORDER_XLSX_PATH does not exist: %s", xlsx_path)
         return 2
+
+    lock_fd = _lock()
+    if lock_fd is None:
+        log.error("Another TAP automation is already running (lock: %s) — two would "
+                  "fight over the browser profile. On the VPS the stock radar holds "
+                  "this lock; stop it first (systemctl stop stock-radar).",
+                  os.environ.get("TAP_LOCK", ROOT / ".lock"))
+        return 1
 
     target_date = dt.date.today() - dt.timedelta(days=1)
     log.info("Target submitted date: %s", target_date.strftime("%m-%d-%Y"))
@@ -108,8 +157,18 @@ def main() -> int:
         xlsx_path,
         skipped,
     )
+    notify(f"Jasco order sync: appended {rows_added} rows from {orders_added} order(s) "
+           f"for {target_date} ({skipped} duplicate order(s) skipped).")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        code = main()
+    except Exception as e:
+        # An unattended VPS run has nobody watching stdout; make sure a crash is heard
+        # about rather than dying quietly in a log file.
+        logging.getLogger("run").exception("Run failed")
+        notify(f"Jasco order sync FAILED: {type(e).__name__}: {e}")
+        raise
+    raise SystemExit(code)

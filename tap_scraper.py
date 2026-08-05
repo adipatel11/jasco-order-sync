@@ -131,6 +131,25 @@ def login(page: Page, username: str, password: str, interactive: bool = True) ->
     input("Then press Enter here once you're logged in... ")
 
 
+def dismiss_duplicate_tab_interstitial(page: Page, timeout: int = 5000) -> None:
+    """Click through TAP's "duplicated a browser tab" page if it appears.
+
+    TAP ties its session to a per-tab token. Opening TAP while the previous
+    server-side session is still warm — e.g. this job starting seconds after the
+    stock radar's browser closed — gets this interstitial instead of the login page
+    or dashboard, and every retry re-warms the session, so without clicking
+    "Start Over" we'd wedge on it. (Same handler as the radar's tap_session.py.)
+    """
+    start_over = page.get_by_role("link", name="Click Here to Start Over")
+    try:
+        start_over.wait_for(state="visible", timeout=timeout)
+    except PWTimeout:
+        return
+    log.info("TAP 'duplicated tab' interstitial shown — clicking 'Start Over'")
+    start_over.click()
+    page.wait_for_load_state("domcontentloaded")
+
+
 def _filter_box(page: Page):
     return page.get_by_role("textbox", name="Filter Retail Orders")
 
@@ -192,6 +211,7 @@ def _go_to_orders(page: Page) -> None:
 def load_or_login(page: Page, username: str, password: str, interactive: bool = True) -> None:
     """Ensure we end up on the Retail Orders list, logging in only if needed."""
     page.goto(TAP_URL, wait_until="domcontentloaded")
+    dismiss_duplicate_tab_interstitial(page)
     if _on_login_page(page):
         log.info("No active session — performing login")
         login(page, username, password, interactive=interactive)
