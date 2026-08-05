@@ -1,0 +1,47 @@
+# systemd unit for the nightly order sync. Install on the VPS:
+#   cp deploy/order-sync.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now order-sync.timer
+# Triggered by order-sync.timer, not enabled directly.
+#
+# This job and stock-radar.service drive the SAME Chromium profile and the same
+# TAP account, so they must never overlap: TAP ties its session to a per-tab
+# token, and two Chromiums do not fit in 2 GB anyway. So the radar is stopped
+# for the duration and started again afterwards.
+
+[Unit]
+Description=Jasco order sync — append yesterday's TAP orders to the master workbook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jasco
+Group=jasco
+WorkingDirectory=/home/jasco/jasco-order-sync
+
+# '+' runs these as root regardless of User=jasco, which is what lets an
+# unprivileged job manage the radar's unit.
+# `systemctl stop` blocks until the radar has fully exited, so the browser
+# profile and the shared .lock are released before we touch them.
+ExecStartPre=+/usr/bin/systemctl stop stock-radar.service
+# Let TAP's server-side session go cold. Reusing it while still warm is what
+# produces the "you duplicated a browser tab" interstitial.
+ExecStartPre=/bin/sleep 60
+
+# xvfb-run matches the radar's invocation: a virtual display, since a headless
+# Chromium announces itself differently and can re-trigger TAP's MFA.
+# --auto-servernum avoids stale X locks after an unclean exit.
+ExecStart=/usr/bin/xvfb-run --auto-servernum /home/jasco/jasco-order-sync/.venv/bin/python run.py
+
+# Bound the whole thing. Without this, a run wedged inside Playwright would keep
+# the radar stopped indefinitely; on timeout systemd kills us and still runs
+# ExecStopPost, so the radar comes back.
+TimeoutStartSec=1800
+
+# ExecStopPost runs on success, failure, AND timeout — so the radar is restored
+# no matter how this job ends. --no-block just enqueues the start job, which
+# cannot deadlock against our own shutdown.
+ExecStopPost=+/usr/bin/systemctl start --no-block stock-radar.service
+
+[Install]
+WantedBy=multi-user.target

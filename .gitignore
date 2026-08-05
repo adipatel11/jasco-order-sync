@@ -1,10 +1,15 @@
 .env
-.browser_profile/
+# No trailing slash: on a shared-profile deployment this is a symlink to another
+# project's profile, and a trailing slash would only ever match a real directory.
+.browser_profile
+.lock
 downloads/
 backups/
 logs/
 Practice Files/
 *.ods
+# The master workbook and any copy of it — business data, never committed.
+*.xlsx
 __pycache__/
 *.pyc
 .venv/
