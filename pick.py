@@ -27,11 +27,14 @@ import shutil
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 from dotenv import load_dotenv
 
+import master_workbook
+from master_workbook import GraphAuthRequiredError
 from ods_parser import parse_ods
 from tap_scraper import (
     MFARequiredError,
@@ -41,7 +44,7 @@ from tap_scraper import (
     list_order_numbers,
     load_or_login,
 )
-from xlsx_writer import OrderBatch, write_orders
+from xlsx_writer import OrderBatch
 
 ROOT = Path(__file__).parent
 DOWNLOADS = ROOT / "downloads"
@@ -88,11 +91,11 @@ class PickerApp:
     tuples onto self.q and the Tk loop drains them in _drain (the only safe way to
     touch widgets from outside the main thread)."""
 
-    def __init__(self, root: tk.Tk, username: str, password: str, xlsx_path: Path):
+    def __init__(self, root: tk.Tk, username: str, password: str):
         self.root = root
         self.username = username
         self.password = password
-        self.xlsx_path = xlsx_path
+        self.workbook_url: str | None = None  # set after a successful copy
         self.q: queue.Queue = queue.Queue()
         self.busy = False
         self.fetched_date: dt.date | None = None
@@ -106,6 +109,14 @@ class PickerApp:
 
         self._build_widgets()
         self.root.after(100, self._drain)
+        # Resolve the workbook link off the main thread: it's a network round-trip
+        # and the window should appear instantly whether or not it succeeds.
+        threading.Thread(target=self._resolve_url_worker, daemon=True).start()
+
+    def _resolve_url_worker(self) -> None:
+        url = master_workbook.web_url()
+        if url:
+            self.q.put(("workbook_url", url))
 
     # --- widget construction ----------------------------------------------
     def _build_widgets(self) -> None:
@@ -157,6 +168,12 @@ class PickerApp:
                                    command=self.on_copy, state="disabled")
         self.copy_btn.pack(fill="x", padx=10, pady=(6, 0))
 
+        # The workbook now lives in OneDrive, so the owner can go straight from
+        # copying to looking at it without hunting for the link.
+        self.open_btn = ttk.Button(self.root, text="Open workbook in browser",
+                                   command=self._open_workbook, state="disabled")
+        self.open_btn.pack(fill="x", padx=10, pady=(4, 0))
+
         self.status = tk.StringVar(value="Pick a date and click Fetch.")
         ttk.Label(self.root, textvariable=self.status, relief="sunken",
                   anchor="w").pack(fill="x", side="bottom")
@@ -174,6 +191,10 @@ class PickerApp:
             self.canvas.yview_scroll(-event.delta, "units")
         else:
             self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _open_workbook(self) -> None:
+        if self.workbook_url:
+            webbrowser.open(self.workbook_url)
 
     def _set_date(self, d: dt.date) -> None:
         self.date_var.set(d.strftime("%m-%d-%Y"))
@@ -366,10 +387,13 @@ class PickerApp:
             if not batches:
                 self.q.put(("error", "Nothing was exported — the selected orders had no items."))
                 return
-            _backup, rows_added, orders_added = write_orders(self.xlsx_path, batches, BACKUPS)
-            self.q.put(("copied", rows_added, orders_added, len(selected)))
+            self.q.put(("status", "Updating the workbook in OneDrive…"))
+            result = master_workbook.append(batches, BACKUPS)
+            self.q.put(("copied", result, len(selected)))
         except MFARequiredError:
             self.q.put(("error", REAUTH_MESSAGE))
+        except GraphAuthRequiredError:
+            self.q.put(("error", master_workbook.onedrive.REAUTH_MESSAGE))
         except Exception as e:  # noqa: BLE001 — surfaced to the owner, logged in full
             log.exception("Copy failed")
             self.q.put(("error", f"Couldn't copy orders:\n{e}"))
@@ -397,16 +421,22 @@ class PickerApp:
                 f"Found {len(numbers)} order(s) for {target:%m-%d-%Y} — tick the ones to copy."
                 if numbers else f"No orders found for {target:%m-%d-%Y}."
             )
+        elif kind == "workbook_url":
+            self.workbook_url = msg[1]
+            self.open_btn.config(state="normal")
         elif kind == "copied":
-            _, rows_added, orders_added, requested = msg
-            skipped = requested - orders_added
-            if rows_added == 0:
+            _, result, requested = msg
+            if result.web_url:
+                self.workbook_url = result.web_url
+                self.open_btn.config(state="normal")
+            skipped = requested - result.orders_added
+            if result.rows_added == 0:
                 self.status.set(f"Nothing new — all {requested} were already in the sheet.")
                 messagebox.showinfo(
                     "Done", "Those orders were already in the sheet — nothing was added."
                 )
             else:
-                text = f"Added {rows_added} row(s) from {orders_added} order(s)."
+                text = f"Added {result.rows_added} row(s) from {result.orders_added} order(s)."
                 if skipped:
                     text += f"\n{skipped} were already in the sheet and skipped."
                 self.status.set(text.replace("\n", "  "))
@@ -432,20 +462,20 @@ def main() -> int:
 
     username = os.environ.get("TAP_USERNAME")
     password = os.environ.get("TAP_PASSWORD")
-    xlsx_raw = os.environ.get("ORDER_XLSX_PATH")
-    if not (username and password and xlsx_raw):
+    if not (username and password):
         _fatal_dialog(
-            "Missing configuration",
-            "Set TAP_USERNAME, TAP_PASSWORD and ORDER_XLSX_PATH in .env first.",
+            "Missing configuration", "Set TAP_USERNAME and TAP_PASSWORD in .env first."
         )
         return 2
-    xlsx_path = Path(xlsx_raw).expanduser()
-    if not xlsx_path.exists():
-        _fatal_dialog("Missing workbook", f"ORDER_XLSX_PATH does not exist:\n{xlsx_path}")
+    # Fail before the window opens if the workbook is unreachable — better than
+    # letting the owner pick orders and only then discovering nothing can be saved.
+    problem = master_workbook.check_config()
+    if problem:
+        _fatal_dialog("Can't reach the workbook", problem)
         return 2
 
     root = tk.Tk()
-    PickerApp(root, username, password, xlsx_path)
+    PickerApp(root, username, password)
     root.mainloop()
     return 0
 

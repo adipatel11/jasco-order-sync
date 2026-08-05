@@ -12,7 +12,7 @@ schedule.
 > **Impact:** ~60 minutes of daily manual copying → ~2 minutes (≈1 hour saved per day).
 > Runs fully unattended after a one-time login.
 
-**Stack:** Python · Playwright (headless Chromium) · openpyxl · Tkinter · systemd · ODS/XLSX
+**Stack:** Python · Playwright (headless Chromium) · openpyxl · Microsoft Graph (OneDrive) · Tkinter · systemd · ODS/XLSX
 
 ---
 
@@ -30,8 +30,9 @@ schedule.
 2. **Filters the order list** to a single day's submitted reserve-inventory orders.
 3. **Walks every matching order:** opens it, clicks Export (which fires an `.ods`
    download via a popup), and recovers the order number from the detail page.
-4. **Appends the line items** to the `Pending` sheet of `Order.xlsx`, matching the
-   exact layout the owner maintained by hand:
+4. **Appends the line items** to the `Pending` sheet of `Order.xlsx` — which lives in
+   the owner's **OneDrive**, so the server, the desktop picker, and the owner's browser
+   all read and write one copy. The layout matches what the owner maintained by hand:
 
    | Col | Value | Source |
    | --- | ----- | ------ |
@@ -52,13 +53,22 @@ schedule.
 
 ```
           ┌─────────────┐      ┌──────────────┐      ┌──────────────┐
- run.py ─▶│ tap_scraper  │ ───▶ │  ods_parser  │ ───▶ │  xlsx_writer │ ──▶ Order.xlsx
- pick.py  │ (Playwright) │ .ods │ (rows, no    │ rows │ (append,     │     + backups/
+ run.py ─▶│ tap_scraper  │ ───▶ │  ods_parser  │ ───▶ │  xlsx_writer │
+ pick.py  │ (Playwright) │ .ods │ (rows, no    │ rows │ (append,     │
           │  login/      │      │  totals row) │      │  dedupe,     │
           │  filter/     │      └──────────────┘      │  back up)    │
-          │  iterate/    │                            └──────────────┘
-          │  export)     │
-          └─────────────┘
+          │  iterate/    │                            └──────┬───────┘
+          │  export)     │                                   │ local .xlsx
+          └─────────────┘                            ┌───────▼────────┐
+                                                     │ master_workbook│
+                                                     │  (fetch/push,  │──▶ backups/
+                                                     │   retry)       │
+                                                     └───────┬────────┘
+                                                             │ Graph
+                                                     ┌───────▼────────┐
+                                                     │   onedrive     │──▶ Order.xlsx
+                                                     │ (auth, up/down)│    in OneDrive
+                                                     └────────────────┘
 ```
 
 Both entry points (`run.py` and `pick.py`) share the **same** scraper, parser, and
@@ -124,6 +134,8 @@ already captured is a safe no-op.
   persistent browser context (the key to one-time MFA)
 - **[openpyxl](https://openpyxl.readthedocs.io/)** — reads/writes the `.xlsx` workbook,
   preserving styles and injecting formulas
+- **[MSAL](https://learn.microsoft.com/en-us/entra/msal/python/) + Microsoft Graph** —
+  device-code sign-in and DriveItem up/download for the workbook in OneDrive
 - **Tkinter** — the zero-dependency desktop GUI for the picker
 - **systemd** (service + timer) — scheduling for the daily unattended run on a Linux VPS
 - **ODS parsing** — reads the spreadsheet TAP exports per order
@@ -137,6 +149,8 @@ already captured is a safe no-op.
 | `tap_scraper.py` | Playwright driver: login, filter, list/iterate orders, export |
 | `ods_parser.py` | Reads rows from an exported ODS, drops the totals row |
 | `xlsx_writer.py` | Appends to the `Pending` sheet, dedupes, saves a timestamped backup |
+| `master_workbook.py` | Where the workbook lives: fetch → append → push back, with conflict retry |
+| `onedrive.py` | Microsoft Graph: device-code sign-in, download/upload, the bookmark link |
 | `telegram.py` | Optional success/failure ping for the unattended run |
 | `deploy/` | systemd service + timer for the daily schedule |
 | `backups/` `downloads/` `logs/` | Output, temp ODS landing zone, run logs (all git-ignored) |
@@ -150,19 +164,102 @@ pip install -r requirements.txt
 playwright install chromium
 
 cp .env.example .env
-# edit .env: TAP_USERNAME, TAP_PASSWORD, TAP_ACCOUNT_NAME, ORDER_XLSX_PATH
+# edit .env: TAP_USERNAME, TAP_PASSWORD, TAP_ACCOUNT_NAME,
+#            ONEDRIVE_SHARE_LINK, GRAPH_CLIENT_ID
 ```
 
-Then run it:
+Then sign in to OneDrive once (see the next section for the one-time app
+registration) and run it:
 
 ```bash
-python run.py        # pulls yesterday's orders, appends, backs up
-python pick.py       # opens the interactive picker
+python onedrive.py login   # one-time: prints a code to enter at microsoft.com/devicelogin
+python onedrive.py info    # confirms the workbook is found, prints the owner's bookmark
+
+python run.py              # pulls yesterday's orders, appends, backs up
+python pick.py             # opens the interactive picker
 ```
 
 The **first** run opens a real Chromium window and pauses for MFA — complete the SMS
 code and tick **Trust this device**, then press Enter. The browser profile is saved
 under `.browser_profile/`, so every later run skips login entirely.
+
+## Where the workbook lives
+
+The workbook is a normal `.xlsx` in the owner's OneDrive. Every machine writes that one
+copy, and the owner opens it from a bookmarked Excel Online link — which is the whole
+point: once the daily job moved to a VPS, a workbook sitting on that server was one the
+owner couldn't reach.
+
+It's edited by **download → `openpyxl` → upload**, not through Graph's Excel REST API.
+That looks like the low-tech option and is a deliberate choice:
+
+- The Excel API [doesn't support app-only auth](https://learn.microsoft.com/en-us/graph/api/range-update?view=graph-rest-1.0)
+  (`Range: update` lists Application permissions as "Not supported"), so it buys no
+  credential simplicity over this route.
+- Its v1.0 reference states support for **consumer OneDrive isn't available** — only
+  business tenants. Round-tripping the file through the DriveItem content endpoints
+  works the same on a personal or a work account.
+- It keeps `xlsx_writer.py` — and therefore the formatting, the `VLOOKUP` column, and
+  the dedupe rule — completely unchanged, so the file the owner opens is byte-identical
+  in layout to the one this project has always produced.
+
+**Concurrency.** `run.py` on the VPS and `pick.py` on a desktop are different machines,
+so the repo's `flock` can't keep them apart. Every upload carries the `eTag` of the copy
+it was based on; if the file changed underneath, Graph refuses with `412` and
+`master_workbook` re-downloads and replays the append. That's safe precisely because
+`write_orders` is idempotent — the replay re-skips whatever the other machine already
+wrote, so a lost update becomes a no-op rather than a duplicate.
+
+<details>
+<summary><b>One-time Microsoft app registration</b></summary>
+
+Graph needs an app registration to sign in against. Once, in the
+[Azure portal](https://portal.azure.com) → **Microsoft Entra ID** → **App registrations**:
+
+1. **New registration.** Name it anything. Under *Supported account types* pick
+   **"Accounts in any organizational directory and personal Microsoft accounts"** —
+   that's what lets one registration serve either kind of OneDrive.
+2. Leave the redirect URI blank. Register.
+3. **Authentication** → **Allow public client flows** → **Yes**. Device-code sign-in
+   fails without this.
+4. **API permissions** → **Microsoft Graph** → **Delegated** → **Files.ReadWrite** →
+   Add. (Grant admin consent if it's a work tenant that requires it.)
+5. Copy the **Application (client) ID** into `GRAPH_CLIENT_ID` in `.env`.
+
+No client secret is needed — this is a public client, and the credential that ends up
+on disk is a refresh token scoped to the signed-in user.
+
+Then, on **each** machine that runs the sync or the picker:
+
+```bash
+python onedrive.py login
+```
+
+It prints a short code to enter at `microsoft.com/devicelogin` from any browser (so it
+works fine over SSH on a headless VPS). The token is cached in
+`.graph_token_cache.json` and renewed silently on every run, so a daily job stays signed
+in indefinitely. It only lapses if the password changes or the session is revoked — in
+which case the run logs a clear re-auth message and the picker shows it in a dialog.
+
+</details>
+
+<details>
+<summary><b>Pointing at the workbook</b></summary>
+
+Set **one** of these in `.env`:
+
+| Variable | How to get it |
+| -------- | ------------- |
+| `ONEDRIVE_SHARE_LINK` | In OneDrive, right-click the workbook → **Share** → **Copy link**. Easiest — no need to spell out a folder path. |
+| `ONEDRIVE_FILE_PATH` | A path from the drive root, e.g. `Documents/Jasco/Order.xlsx`. Useful for scripted setup. |
+
+`python onedrive.py info` confirms the file resolves and prints the `webUrl` — that's
+the link to hand the owner to bookmark.
+
+Leaving both unset falls back to **local-file mode** via `ORDER_XLSX_PATH`, which is how
+you test a change against a throwaway copy without touching the real workbook.
+
+</details>
 
 ## Deployment
 
@@ -210,8 +307,12 @@ minutes of downtime a day.
   `~/.cache/ms-playwright`, and a different version wants a different Chromium build.
 - If a scheduled run logs `MFARequiredError`, the trusted-device cookie expired — run
   `python run.py` manually once (with the other job stopped) to re-establish it.
+- If it logs `GraphAuthRequiredError`, the OneDrive sign-in lapsed — run
+  `python onedrive.py login` on the VPS once. The daily cadence normally keeps the
+  refresh token alive on its own.
 - Set `TG_BOT_TOKEN` / `TG_CHAT_ID` to get a Telegram ping on each append or crash;
-  there's no terminal to watch on a server.
+  there's no terminal to watch on a server. The ping now carries the workbook link, so
+  the owner can go straight from the notification to the rows.
 
 </details>
 
@@ -245,17 +346,23 @@ on-demand picker, launched by double-clicking `Order Picker.bat`.
    playwright install chromium
    ```
 3. **Configure `.env`:** copy `.env.example` to `.env` and fill in the TAP credentials,
-   `TAP_ACCOUNT_NAME`, and `ORDER_XLSX_PATH` (use the real Windows path, e.g.
-   `C:\Users\Owner\OneDrive\...\Order.xlsx`).
-4. **Establish the trusted device once** — the picker runs headless and can't do MFA
+   `TAP_ACCOUNT_NAME`, `ONEDRIVE_SHARE_LINK`, and `GRAPH_CLIENT_ID`. Note the workbook
+   is reached through Graph, **not** through the local OneDrive sync folder — so no
+   `C:\Users\...\OneDrive\...` path is involved, and the picker doesn't care whether
+   the OneDrive desktop client is installed or signed in.
+4. **Sign in to OneDrive once:** `python onedrive.py login`, then follow the code it
+   prints. Confirm with `python onedrive.py info`.
+5. **Establish the trusted device once** — the picker runs headless and can't do MFA
    itself, so run `python run.py` once from a terminal, complete the code, and tick
    **Trust this device**.
-5. **Everyday use:** double-click **`Order Picker.bat`** — no terminal needed. Pick a
-   date, **Fetch orders**, tick the ones to copy, **Copy selected → Excel**. Run
-   `Create Desktop Shortcut.bat` once to drop a launcher icon on the Desktop.
+6. **Everyday use:** double-click **`Order Picker.bat`** — no terminal needed. Pick a
+   date, **Fetch orders**, tick the ones to copy, **Copy selected → Excel**, then
+   **Open workbook in browser** to see the result. Run `Create Desktop Shortcut.bat`
+   once to drop a launcher icon on the Desktop.
 
-Each machine keeps its **own** git-ignored `.browser_profile/` and `.env`, so trusting
-one device never affects the other.
+Each machine keeps its **own** git-ignored `.browser_profile/`, `.env`, and
+`.graph_token_cache.json`, so trusting or signing in on one device never affects the
+other.
 
 </details>
 
@@ -265,7 +372,11 @@ This repo is deliberately clean of anything sensitive:
 
 - **Credentials never touch git.** TAP username/password and all paths live only in a
   local `.env` (git-ignored, with a `.env.example` template).
-- **No business data is committed.** The live auth session (`.browser_profile/`),
-  downloaded orders, generated workbooks, and logs are all git-ignored.
+- **No business data is committed.** The live auth session (`.browser_profile/`), the
+  cached OneDrive token (`.graph_token_cache.json`, written `0600`), downloaded orders,
+  generated workbooks, and logs are all git-ignored.
+- **No client secret exists to leak.** OneDrive access uses a public-client
+  registration, so the only credential on disk is a refresh token scoped to the
+  signed-in user's own files, revocable from their Microsoft account at any time.
 - **Account name is a placeholder.** `ACME RETAIL LLC` throughout is a stand-in for the
   real account name, which is supplied per deployment via `TAP_ACCOUNT_NAME`.

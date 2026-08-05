@@ -3,6 +3,8 @@
 # project's profile, and a trailing slash would only ever match a real directory.
 .browser_profile
 .lock
+# The cached OneDrive refresh token — a live credential for the owner's account.
+.graph_token_cache.json
 downloads/
 backups/
 logs/

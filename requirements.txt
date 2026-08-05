@@ -5,5 +5,8 @@
 playwright==1.61.0
 openpyxl>=3.1
 python-dotenv>=1.0
-# Used only by telegram.py, for the unattended VPS run's success/failure ping.
+# Used by telegram.py for the unattended run's ping, and by onedrive.py for Graph.
 requests>=2.31
+# Microsoft Graph sign-in for the staging workbook in OneDrive. Handles the
+# device-code bootstrap and, thereafter, silent refresh-token renewal.
+msal>=1.28

@@ -16,9 +16,10 @@ except ImportError:
 
 from dotenv import load_dotenv
 
+import master_workbook
 from ods_parser import parse_ods
 from tap_scraper import apply_filter, chrome_session, iter_orders, load_or_login
-from xlsx_writer import OrderBatch, write_orders
+from xlsx_writer import OrderBatch
 
 ROOT = Path(__file__).parent
 DOWNLOADS = ROOT / "downloads"
@@ -87,15 +88,16 @@ def main() -> int:
 
     username = os.environ.get("TAP_USERNAME")
     password = os.environ.get("TAP_PASSWORD")
-    xlsx_path_raw = os.environ.get("ORDER_XLSX_PATH")
     headless = os.environ.get("HEADLESS", "false").lower() == "true"
 
-    if not (username and password and xlsx_path_raw):
-        log.error("Missing TAP_USERNAME, TAP_PASSWORD, or ORDER_XLSX_PATH in .env")
+    if not (username and password):
+        log.error("Missing TAP_USERNAME or TAP_PASSWORD in .env")
         return 2
-    xlsx_path = Path(xlsx_path_raw).expanduser()
-    if not xlsx_path.exists():
-        log.error("ORDER_XLSX_PATH does not exist: %s", xlsx_path)
+    # Check the workbook is reachable BEFORE scraping — a bad OneDrive config or a
+    # lapsed sign-in should cost a second, not a full run against TAP.
+    problem = master_workbook.check_config()
+    if problem:
+        log.error("%s", problem)
         return 2
 
     lock_fd = _lock()
@@ -139,26 +141,32 @@ def main() -> int:
         log.info("No orders found for %s — nothing to do", target_date)
         return 0
 
-    backup_path, rows_added, orders_added = write_orders(xlsx_path, batches, BACKUPS)
-    skipped = len(batches) - orders_added
-    if rows_added == 0:
+    result = master_workbook.append(batches, BACKUPS)
+    skipped = len(batches) - result.orders_added
+    if result.rows_added == 0:
         log.info(
-            "Nothing new for %s — master left untouched (%d duplicate orders skipped)",
+            "Nothing new for %s — workbook left untouched (%d duplicate orders skipped)",
             target_date,
             skipped,
         )
         return 0
     log.info(
-        "Backed up master to %s; appended %d rows from %d orders into %s "
-        "(%d duplicate orders skipped)",
-        backup_path,
-        rows_added,
-        orders_added,
-        xlsx_path,
+        "Backed up to %s; appended %d rows from %d orders (%d duplicate orders skipped)",
+        result.backup_path,
+        result.rows_added,
+        result.orders_added,
         skipped,
     )
-    notify(f"Jasco order sync: appended {rows_added} rows from {orders_added} order(s) "
-           f"for {target_date} ({skipped} duplicate order(s) skipped).")
+    # The owner reads this on their phone, so include the link — it's the whole point
+    # of the workbook living in OneDrive rather than on a server they can't reach.
+    message = (
+        f"Jasco order sync: appended {result.rows_added} rows from "
+        f"{result.orders_added} order(s) for {target_date} "
+        f"({skipped} duplicate order(s) skipped)."
+    )
+    if result.web_url:
+        message += f"\n\nOpen the workbook: {result.web_url}"
+    notify(message)
     return 0
 
 
