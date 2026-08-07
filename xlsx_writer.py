@@ -13,7 +13,13 @@ from openpyxl import load_workbook
 from ods_parser import OdsRow
 
 PENDING_SHEET = "Pending"
-FIRST_DATA_ROW = 4  # rows 1-3 are header/title/sum
+# The sheet's real layout: row 1 is a stray leftover data row, row 2 the "Pending"
+# title, row 3 the =TODAY()/=SUM() line, and row 4 the column headers ("Item code",
+# "Name", …). So appended data starts at row 5. This was 4 — which happened to work,
+# because _next_empty_row only scans for the first blank in column A and row 4's
+# header is not blank, but it made the dedupe read the header cell as an order.
+FIRST_DATA_ROW = 5
+ORDER_HEADER_LABEL = "Order"  # the column-E header, never a real order number
 LAST_FORMAT_COL = 7  # copy formatting for columns A-G (G stays empty but needs borders)
 DATE_FORMAT = "m/d/yyyy"
 
@@ -66,11 +72,23 @@ class OrderBatch:
 
 
 def _existing_order_numbers(ws) -> set[str]:
+    """Every order number already in column E, wherever in the sheet it sits.
+
+    Deliberately scans the whole column instead of starting at FIRST_DATA_ROW. The
+    sheet carries a stray data row at row 1 whose order would otherwise be invisible
+    here, and the cost of the two mistakes is wildly asymmetric: an over-inclusive
+    set can only cause an order to be skipped as already-present, while a missing one
+    double-enters it into the owner's book. The header cell is the one value in the
+    column that is never an order number, so it is the only thing filtered out.
+    """
     seen: set[str] = set()
-    for row in ws.iter_rows(min_row=FIRST_DATA_ROW, min_col=5, max_col=5, values_only=True):
+    for row in ws.iter_rows(min_col=5, max_col=5, values_only=True):
         val = row[0]
-        if val:
-            seen.add(str(val).strip())
+        if not val:
+            continue
+        text = str(val).strip()
+        if text and text != ORDER_HEADER_LABEL:
+            seen.add(text)
     return seen
 
 
