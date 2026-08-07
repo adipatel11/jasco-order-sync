@@ -61,6 +61,23 @@ class WorkbookChangedError(RuntimeError):
     """The cloud copy changed while we were editing it; our upload was refused."""
 
 
+class WorkbookLockedError(RuntimeError):
+    """Someone has the workbook open for editing, so OneDrive won't accept a write.
+
+    Graph answers 423 while an Excel Online (or desktop Excel) session holds the
+    file. Transient — the lock clears once the editor closes it — but on a
+    human timescale, not a network one, so it wants a real wait rather than the
+    sub-second backoff in request().
+    """
+
+
+LOCKED_MESSAGE = (
+    "The workbook is open for editing in OneDrive, so it can't be updated right now.\n\n"
+    "Close “Order Staging Copy.xlsx” in Excel Online (or the Excel desktop app) and "
+    "try again. Nothing was written, and no orders were lost."
+)
+
+
 REAUTH_MESSAGE = (
     "OneDrive sign-in has expired.\n\n"
     "Run `python onedrive.py login` in a terminal on this machine and complete the "
@@ -282,6 +299,8 @@ def _upload_simple(ref: WorkbookRef, src: Path, if_match: str | None) -> None:
     resp = request("PUT", f"{ref.base}/content", headers=headers, data=src.read_bytes())
     if resp.status_code == 412:
         raise WorkbookChangedError(f"{ref.name} changed in OneDrive while we were editing it")
+    if resp.status_code == 423:
+        raise WorkbookLockedError(f"{ref.name} is open for editing in OneDrive")
     if not resp.ok:
         _fail(resp, f"Uploading {ref.name}")
 
@@ -304,6 +323,8 @@ def _upload_chunked(ref: WorkbookRef, src: Path, if_match: str | None) -> None:
         f"{ref.base}/createUploadSession",
         json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
     )
+    if resp.status_code == 423:
+        raise WorkbookLockedError(f"{ref.name} is open for editing in OneDrive")
     if not resp.ok:
         _fail(resp, f"Starting an upload session for {ref.name}")
     session_url = resp.json()["uploadUrl"]

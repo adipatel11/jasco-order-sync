@@ -34,7 +34,7 @@ from tkinter import messagebox, ttk
 from dotenv import load_dotenv
 
 import master_workbook
-from master_workbook import GraphAuthRequiredError
+from master_workbook import GraphAuthRequiredError, WorkbookLockedError
 from ods_parser import parse_ods
 from tap_scraper import (
     MFARequiredError,
@@ -394,6 +394,10 @@ class PickerApp:
             self.q.put(("error", REAUTH_MESSAGE))
         except GraphAuthRequiredError:
             self.q.put(("error", master_workbook.onedrive.REAUTH_MESSAGE))
+        except WorkbookLockedError as e:
+            # The likeliest failure by far in day-to-day use: the owner is looking at
+            # the workbook while copying into it. Say exactly what to do about it.
+            self.q.put(("error", str(e)))
         except Exception as e:  # noqa: BLE001 — surfaced to the owner, logged in full
             log.exception("Copy failed")
             self.q.put(("error", f"Couldn't copy orders:\n{e}"))

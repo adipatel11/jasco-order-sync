@@ -15,11 +15,16 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import onedrive
-from onedrive import GraphAuthRequiredError, WorkbookChangedError  # re-exported for callers
+from onedrive import (  # re-exported for callers
+    GraphAuthRequiredError,
+    WorkbookChangedError,
+    WorkbookLockedError,
+)
 from xlsx_writer import OrderBatch, write_orders
 
 # run.py on the VPS and pick.py on a desktop are different machines, so the repo's
@@ -28,6 +33,13 @@ from xlsx_writer import OrderBatch, write_orders
 # append-only, so replaying it is safe — the retry simply re-skips whatever the
 # winner already wrote.
 MAX_UPLOAD_ATTEMPTS = 3
+
+# A 423 means a person has the workbook open in Excel Online — likely, since the
+# whole point of OneDrive is that the owner opens it. That clears on a human
+# timescale, so these waits are seconds-to-a-minute rather than the sub-second
+# backoff request() uses for throttling. Indexed by attempt, so the total patience
+# is about a minute before we give up and say so plainly.
+LOCK_RETRY_DELAYS = (20, 40)
 
 log = logging.getLogger("workbook")
 
@@ -112,18 +124,30 @@ def _append_cloud(batches: list[OrderBatch], backups_dir: Path) -> WriteResult:
 
             try:
                 onedrive.upload(ref, local, if_match=etag)
-            except WorkbookChangedError:
-                # Someone else wrote between our download and our upload. Drop the
-                # backup for this attempt — it documents a state we never modified —
-                # and redo the append against the copy that actually won.
+            except (WorkbookChangedError, WorkbookLockedError) as e:
+                # Neither case wrote anything, so the backup taken this pass
+                # documents a state we never modified — drop it rather than leave a
+                # restore point for an edit that didn't happen.
                 if backup and backup.exists():
                     backup.unlink()
                 if attempt == MAX_UPLOAD_ATTEMPTS:
+                    if isinstance(e, WorkbookLockedError):
+                        raise WorkbookLockedError(onedrive.LOCKED_MESSAGE) from e
                     raise
-                log.warning(
-                    "%s changed in OneDrive mid-edit; retrying (attempt %d/%d)",
-                    ref.name, attempt, MAX_UPLOAD_ATTEMPTS,
-                )
+                if isinstance(e, WorkbookLockedError):
+                    delay = LOCK_RETRY_DELAYS[min(attempt - 1, len(LOCK_RETRY_DELAYS) - 1)]
+                    log.warning(
+                        "%s is open for editing in OneDrive; waiting %ds then retrying "
+                        "(attempt %d/%d)", ref.name, delay, attempt, MAX_UPLOAD_ATTEMPTS,
+                    )
+                    time.sleep(delay)
+                else:
+                    log.warning(
+                        "%s changed in OneDrive mid-edit; retrying (attempt %d/%d)",
+                        ref.name, attempt, MAX_UPLOAD_ATTEMPTS,
+                    )
+                # Re-download either way: a lock usually means the editor also saved,
+                # so our eTag is stale and the sheet may have new rows.
                 continue
 
             return WriteResult(backup, rows, orders, ref.web_url)
