@@ -28,6 +28,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import msal
 import requests
@@ -185,10 +186,21 @@ class WorkbookRef:
     item_id: str
     name: str
     web_url: str  # what the owner bookmarks — opens in Excel Online
+    path: str = ""  # drive-root-relative, i.e. a ready-made ONEDRIVE_FILE_PATH
 
     @property
     def base(self) -> str:
         return f"/drives/{self.drive_id}/items/{self.item_id}"
+
+
+def _item_path(item: dict) -> str:
+    """Drive-root-relative path of an item, from its parentReference.
+
+    parentReference.path looks like '/drives/{id}/root:/Documents/doc/Order' (or
+    '/drive/root:' for something sitting at the top level).
+    """
+    folder = item.get("parentReference", {}).get("path", "").split("root:", 1)[-1].lstrip("/")
+    return f"{folder}/{item['name']}" if folder else item["name"]
 
 
 def _encode_share_url(url: str) -> str:
@@ -224,7 +236,9 @@ def resolve() -> WorkbookRef:
     drive_id = item.get("parentReference", {}).get("driveId")
     if not drive_id:
         raise RuntimeError(f"Graph returned no driveId for {item.get('name')!r}")
-    return WorkbookRef(drive_id, item["id"], item["name"], item.get("webUrl", ""))
+    return WorkbookRef(
+        drive_id, item["id"], item["name"], item.get("webUrl", ""), _item_path(item)
+    )
 
 
 def download(ref: WorkbookRef, dest: Path) -> str:
@@ -315,6 +329,32 @@ def _upload_chunked(ref: WorkbookRef, src: Path, if_match: str | None) -> None:
 
 # --- CLI --------------------------------------------------------------------
 
+def _find(term: str) -> int:
+    """Print ONEDRIVE_FILE_PATH candidates for workbooks matching term.
+
+    For discovery only, when you don't yet have a locator at all. It leans on Graph's
+    search index, which lags by a while for freshly created files — a brand new
+    workbook genuinely will not show up here. Once anything resolves, `info` prints
+    the exact path straight off the item and is always right.
+    """
+    # The search term is single-quoted inside an OData function call, where a
+    # literal quote is escaped by doubling it.
+    q = quote(term.replace("'", "''"))
+    resp = request("GET", f"/me/drive/root/search(q='{q}')?$select=name,webUrl,parentReference")
+    if not resp.ok:
+        _fail(resp, f"Searching for {term!r}")
+
+    hits = [i for i in resp.json().get("value", []) if i["name"].lower().endswith(".xlsx")]
+    if not hits:
+        print(f"No .xlsx matching {term!r} in this account's OneDrive.")
+        return 1
+
+    for item in hits:
+        print(f"ONEDRIVE_FILE_PATH={_item_path(item)}")
+        print(f"  {item.get('webUrl', '')}\n")
+    return 0
+
+
 def main() -> int:
     from dotenv import load_dotenv
 
@@ -331,13 +371,18 @@ def main() -> int:
             ref = resolve()
             print(f"Workbook : {ref.name}")
             print(f"Size     : {request('GET', ref.base + '?$select=size').json().get('size')} bytes")
+            # Exact, and unlike `find` it doesn't wait on the search index — so this
+            # is how you move off a share link onto a path.
+            print(f"\nONEDRIVE_FILE_PATH={ref.path}")
             print(f"\nBookmark this link for the owner:\n{ref.web_url}")
             return 0
+        if cmd == "find":
+            return _find(" ".join(sys.argv[2:]) or "Order")
     except GraphAuthRequiredError:
         print(REAUTH_MESSAGE, file=sys.stderr)
         return 2
 
-    print(f"usage: python onedrive.py [login|info]  (got {cmd!r})", file=sys.stderr)
+    print(f"usage: python onedrive.py [login|info|find <name>]  (got {cmd!r})", file=sys.stderr)
     return 1
 
 

@@ -17,6 +17,29 @@ FIRST_DATA_ROW = 4  # rows 1-3 are header/title/sum
 LAST_FORMAT_COL = 7  # copy formatting for columns A-G (G stays empty but needs borders)
 DATE_FORMAT = "m/d/yyyy"
 
+# The size lookup table the generated column-C formula points at.
+SIZE_DATA_SHEET = "SizeData"
+# Used only if that sheet is missing; matches the range the formula used to hardcode.
+SIZE_DATA_FALLBACK_ROWS = 3974
+
+
+def _size_data_rows(wb) -> int:
+    """Last populated row of SizeData, for the VLOOKUP range.
+
+    This used to be hardcoded to 3974, which silently stopped working the moment a
+    3975th item was added: the lookup would miss and every new row's size would come
+    back #N/A with nothing raising an error. Measuring the sheet keeps the generated
+    formula correct as the catalogue grows.
+    """
+    if SIZE_DATA_SHEET not in wb.sheetnames:
+        return SIZE_DATA_FALLBACK_ROWS
+    ws = wb[SIZE_DATA_SHEET]
+    # Walk up from max_row: it can be inflated by stray formatting on empty cells.
+    for row in range(ws.max_row, 0, -1):
+        if ws.cell(row=row, column=1).value not in (None, ""):
+            return row
+    return SIZE_DATA_FALLBACK_ROWS
+
 
 def _copy_row_format(ws, template_row: int, target_row: int) -> None:
     """Replicate the cell formatting of template_row onto target_row (cols A-F).
@@ -78,6 +101,7 @@ def write_orders(
 
     seen = _existing_order_numbers(ws)
     next_row = _next_empty_row(ws)
+    size_rows = _size_data_rows(wb)
     # Template for formatting: the last existing data row. None if the sheet is empty.
     template_row = next_row - 1 if next_row - 1 >= FIRST_DATA_ROW else None
 
@@ -94,7 +118,9 @@ def write_orders(
             ws.cell(
                 row=next_row,
                 column=3,
-                value=f"=VLOOKUP(A{next_row},SizeData!A$1:B$3974,2,FALSE)",
+                value=(
+                    f"=VLOOKUP(A{next_row},{SIZE_DATA_SHEET}!A$1:B${size_rows},2,FALSE)"
+                ),
             )
             ws.cell(row=next_row, column=4, value=r.reserved_qty)
             ws.cell(row=next_row, column=5, value=batch.order_number)
