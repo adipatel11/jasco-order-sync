@@ -167,9 +167,15 @@ def request(method: str, url: str, **kwargs) -> requests.Response:
     if not url.startswith("http"):
         url = GRAPH + url
 
+    # Pop ONCE, outside the loop. Popping per-attempt drops the caller's headers on
+    # every retry but the first — which silently disarmed the if-match guard on a
+    # retried upload, turning a conflict Graph would have refused into a lost update.
+    caller_headers = dict(kwargs.pop("headers", {}) or {})
+
     resp = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        headers = dict(kwargs.pop("headers", {}) or {})
+        headers = dict(caller_headers)
+        # Re-read the token each attempt: a long backoff can outlive the old one.
         headers.setdefault("Authorization", f"Bearer {get_token()}")
         resp = requests.request(method, url, headers=headers, timeout=120, **kwargs)
 
