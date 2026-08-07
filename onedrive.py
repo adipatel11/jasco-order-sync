@@ -220,6 +220,21 @@ def _item_path(item: dict) -> str:
     return f"{folder}/{item['name']}" if folder else item["name"]
 
 
+# Excel Online holds a lock on the file for as long as it is open for EDITING, and
+# OneDrive then rejects our uploads with 423. Viewing mode takes no such lock —
+# confirmed against the live workbook, where an append succeeded while the owner had
+# it open in Viewing mode. Since the owner only ever copies rows OUT of the staging
+# workbook and never edits it, Viewing is the mode to leave it in permanently.
+#
+# There is no URL parameter that forces this on personal OneDrive: appending
+# `action=view` to the webUrl produces an error page. The mode has to be set in the
+# Excel Online UI, via the Editing/Viewing switcher at the top right.
+VIEW_MODE_HINT = (
+    "Open it, then set the mode switcher (top right) to Viewing. Editing mode locks\n"
+    "the file and blocks the sync; Viewing mode does not, and copy/paste still works."
+)
+
+
 def _encode_share_url(url: str) -> str:
     """Turn a OneDrive share link into the /shares/{id} token Graph expects."""
     b64 = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
@@ -396,6 +411,7 @@ def main() -> int:
             # is how you move off a share link onto a path.
             print(f"\nONEDRIVE_FILE_PATH={ref.path}")
             print(f"\nBookmark this link for the owner:\n{ref.web_url}")
+            print(f"\n{VIEW_MODE_HINT}")
             return 0
         if cmd == "find":
             return _find(" ".join(sys.argv[2:]) or "Order")
