@@ -38,7 +38,7 @@ schedule.
    | --- | ----- | ------ |
    | `A` | Item # | ODS col A |
    | `B` | Name | ODS col B |
-   | `C` | `=VLOOKUP(A{row},SizeData!A$1:B$3974,2,FALSE)` | generated formula |
+   | `C` | `=VLOOKUP(A{row},SizeData!A$1:B${n},2,FALSE)` | generated formula; `n` is measured from `SizeData` on each write, so it tracks the catalogue as it grows |
    | `D` | Reserved Quantity | ODS col H |
    | `E` | Order # | scraped from the order page |
    | `F` | Date | the target day, as an Excel date |
@@ -165,7 +165,7 @@ playwright install chromium
 
 cp .env.example .env
 # edit .env: TAP_USERNAME, TAP_PASSWORD, TAP_ACCOUNT_NAME,
-#            ONEDRIVE_SHARE_LINK, GRAPH_CLIENT_ID
+#            ONEDRIVE_FILE_PATH, GRAPH_CLIENT_ID
 ```
 
 Then sign in to OneDrive once (see the next section for the one-time app
@@ -202,6 +202,25 @@ That looks like the low-tech option and is a deliberate choice:
 - It keeps `xlsx_writer.py` — and therefore the formatting, the `VLOOKUP` column, and
   the dedupe rule — completely unchanged, so the file the owner opens is byte-identical
   in layout to the one this project has always produced.
+
+> [!IMPORTANT]
+> **The owner must keep the workbook in Excel Online's *Viewing* mode, not *Editing*.**
+> An Editing session holds a lock and OneDrive rejects every write with `423`; the sync
+> retries for about a minute, then fails with a message naming the file to close. There
+> is no URL parameter that forces the mode on personal OneDrive — appending
+> `action=view` to the `webUrl` just yields an error page — so it has to be set with the
+> Editing/Viewing switcher at the top right of Excel Online.
+>
+> This costs nothing: the owner only ever *copies rows out* of the staging workbook and
+> never edits it, and copy/paste works identically in Viewing mode. Verified against the
+> live workbook — a full sync appended 12 rows while the owner had it open in Viewing.
+
+**What's in the workbook.** Only two sheets: `Pending` (appended to) and `SizeData`
+(the size lookup the generated column-C formula points at, and which 11 sheets in the
+owner's real master reference). Everything else was removed — the staging copy exists
+to be copied *out of*, so a 1.9 MB workbook of history made every run download and
+re-upload ~30× more than it needed to. **If the staging copy is ever refreshed from the
+master, all the other sheets come back and it should be trimmed again.**
 
 **Concurrency.** `run.py` on the VPS and `pick.py` on a desktop are different machines,
 so the repo's `flock` can't keep them apart. Every upload carries the `eTag` of the copy
@@ -250,11 +269,15 @@ Set **one** of these in `.env`:
 
 | Variable | How to get it |
 | -------- | ------------- |
-| `ONEDRIVE_SHARE_LINK` | In OneDrive, right-click the workbook → **Share** → **Copy link**. Easiest — no need to spell out a folder path. |
-| `ONEDRIVE_FILE_PATH` | A path from the drive root, e.g. `Documents/Jasco/Order.xlsx`. Useful for scripted setup. |
+| `ONEDRIVE_FILE_PATH` | **Preferred.** A path from the drive root, e.g. `Documents/Jasco/Order.xlsx`. Creates no sharing surface at all. |
+| `ONEDRIVE_SHARE_LINK` | **Share** → **Copy link**. Wins over the path if both are set. Check its audience first — "Anyone with the link" is a public, *editable* URL to a workbook full of business data. |
 
-`python onedrive.py info` confirms the file resolves and prints the `webUrl` — that's
-the link to hand the owner to bookmark.
+`python onedrive.py info` confirms the file resolves, prints the `webUrl` to hand the
+owner to bookmark, and prints the exact `ONEDRIVE_FILE_PATH` read off the item itself.
+
+Don't use `onedrive.py find` to get that path — it searches, and Graph's search index
+lags badly for recently created files, so a freshly made workbook genuinely won't
+appear. `find` is for discovery when you have no locator at all; `info` is exact.
 
 Leaving both unset falls back to **local-file mode** via `ORDER_XLSX_PATH`, which is how
 you test a change against a throwaway copy without touching the real workbook.
@@ -346,7 +369,7 @@ on-demand picker, launched by double-clicking `Order Picker.bat`.
    playwright install chromium
    ```
 3. **Configure `.env`:** copy `.env.example` to `.env` and fill in the TAP credentials,
-   `TAP_ACCOUNT_NAME`, `ONEDRIVE_SHARE_LINK`, and `GRAPH_CLIENT_ID`. Note the workbook
+   `TAP_ACCOUNT_NAME`, `ONEDRIVE_FILE_PATH`, and `GRAPH_CLIENT_ID`. Note the workbook
    is reached through Graph, **not** through the local OneDrive sync folder — so no
    `C:\Users\...\OneDrive\...` path is involved, and the picker doesn't care whether
    the OneDrive desktop client is installed or signed in.
