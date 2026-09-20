@@ -8,8 +8,8 @@ REM Safe to run more than once -- it just overwrites the existing shortcut.
 
 cd /d "%~dp0"
 
-REM GetFolderPath('Desktop') respects a OneDrive-redirected Desktop, unlike a hard
-REM-coded %USERPROFILE%\Desktop. The shortcut targets the .bat and runs it from here.
+REM GetFolderPath('Desktop') respects a OneDrive-redirected Desktop, unlike a
+REM hard-coded %USERPROFILE%\Desktop. The shortcut targets the .bat and runs it from here.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$d=[Environment]::GetFolderPath('Desktop'); $lnk=Join-Path $d 'Jasco Order Picker.lnk'; $w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut($lnk); $s.TargetPath='%~dp0Order Picker.bat'; $s.WorkingDirectory='%CD%'; $s.Description='Launch the Jasco order picker'; $s.Save(); Write-Host ('Created: ' + $lnk)"
 
 if errorlevel 1 (
