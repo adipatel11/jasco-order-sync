@@ -1,16 +1,19 @@
-"""Interactive picker: choose a date, see that day's TAP orders, tick which to copy.
+"""Interactive picker: choose up to 10 dates, see their TAP orders, tick which to copy.
 
 Companion to run.py (the unattended midnight job). It shares the SAME scraper, ODS
-parser, and xlsx writer — the only difference is that the owner chooses the date and
-chooses *which* orders get appended to Order.xlsx, through a small Tkinter window.
+parser, and xlsx writer — the only difference is that the owner chooses the dates and
+chooses *which* orders get written to Order.xlsx, through a small Tkinter window.
 
 Two phases, each a short self-contained browser session that reuses the persistent
 `.browser_profile` (so in normal use there is no re-login or MFA):
-  1. Fetch — filter the chosen date and list its order numbers (no downloads yet).
-  2. Copy  — export only the ticked orders, parse them, append to Order.xlsx.
+  1. Fetch — filter each chosen date in turn and list its order numbers (no downloads
+     yet). One filter per date so every order's date is known for certain.
+  2. Copy  — filter all the ticked orders' dates at once ((d1 OR d2 …) AND status),
+     export only the ticked orders, parse them, and write them to Order.xlsx.
 
-write_orders is idempotent (it skips order numbers already present in column E), so
-picking an order the midnight job already captured is harmless — it just gets skipped.
+Copying REPLACES a date: every row already in the sheet dated one of the ticked
+orders' days is deleted first, then the fresh export is appended. So re-copying a day
+always leaves the sheet matching TAP, rather than skipping orders already present.
 
 The browser work runs on background threads; results come back to the Tk main loop
 through a queue, so the window never freezes while TAP is being driven.
@@ -64,6 +67,10 @@ REAUTH_MESSAGE = (
     "code, ticking “Trust this device”. Then try the picker again."
 )
 
+# Each date is its own filter pass on TAP during Fetch, so keep the list short.
+MAX_DATES = 10
+DATE_FMT = "%m-%d-%Y"
+
 log = logging.getLogger("pick")
 
 
@@ -98,14 +105,18 @@ class PickerApp:
         self.workbook_url: str | None = None  # set after a successful copy
         self.q: queue.Queue = queue.Queue()
         self.busy = False
-        self.fetched_date: dt.date | None = None
+        self.dates: list[dt.date] = []  # the chosen dates, kept sorted
+        # What the last Fetch returned: which date each listed order belongs to, and
+        # every order per date (to spot unticked orders on a date being replaced).
+        self.order_date: dict[str, dt.date] = {}
+        self.fetched: dict[dt.date, list[str]] = {}
         self.check_vars: dict[str, tk.BooleanVar] = {}
         self._cal_win: tk.Toplevel | None = None  # the open calendar popup, if any
         self._cal_view = (dt.date.today().year, dt.date.today().month)
 
         root.title("Jasco Order Picker")
-        root.geometry("440x560")
-        root.minsize(380, 420)
+        root.geometry("460x700")
+        root.minsize(400, 560)
 
         self._build_widgets()
         self.root.after(100, self._drain)
@@ -125,17 +136,45 @@ class PickerApp:
         top = ttk.Frame(self.root)
         top.pack(fill="x", padx=10, pady=(10, 4))
         ttk.Label(top, text="Date (MM-DD-YYYY):").pack(side="left")
-        self.date_var = tk.StringVar(value=yesterday.strftime("%m-%d-%Y"))
+        self.date_var = tk.StringVar(value=yesterday.strftime(DATE_FMT))
         self.date_entry = ttk.Entry(top, textvariable=self.date_var, width=12)
         self.date_entry.pack(side="left", padx=6)
+        self.date_entry.bind("<Return>", lambda e: self._add_typed_date())
+        self.add_btn = ttk.Button(top, text="Add", width=5, command=self._add_typed_date)
+        self.add_btn.pack(side="left")
         # Our own calendar popup (a plain Toplevel of buttons) — tkcalendar's
         # drop-down is unusable on macOS, so we roll a small reliable one.
-        self.cal_btn = ttk.Button(top, text="Pick…", width=6, command=self._open_calendar)
-        self.cal_btn.pack(side="left")
-        ttk.Button(top, text="Yesterday",
-                   command=lambda: self._set_date(yesterday)).pack(side="left", padx=(6, 0))
-        ttk.Button(top, text="Today",
-                   command=lambda: self._set_date(dt.date.today())).pack(side="left", padx=4)
+        self.cal_btn = ttk.Button(top, text="Calendar…", command=self._open_calendar)
+        self.cal_btn.pack(side="left", padx=(6, 0))
+
+        quick = ttk.Frame(self.root)
+        quick.pack(fill="x", padx=10, pady=(0, 4))
+        self.yesterday_btn = ttk.Button(quick, text="+ Yesterday",
+                                        command=lambda: self._add_date(yesterday))
+        self.yesterday_btn.pack(side="left")
+        self.today_btn = ttk.Button(quick, text="+ Today",
+                                    command=lambda: self._add_date(dt.date.today()))
+        self.today_btn.pack(side="left", padx=4)
+
+        self.dates_frame = ttk.LabelFrame(self.root)
+        self.dates_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.dates_list = tk.Listbox(self.dates_frame, height=5, selectmode="extended",
+                                     exportselection=False, activestyle="none")
+        dates_scroll = ttk.Scrollbar(self.dates_frame, orient="vertical",
+                                     command=self.dates_list.yview)
+        self.dates_list.configure(yscrollcommand=dates_scroll.set)
+        self.dates_list.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        dates_scroll.pack(side="left", fill="y", pady=6)
+        for key in ("<Delete>", "<BackSpace>"):
+            self.dates_list.bind(key, lambda e: self._remove_selected_dates())
+        date_btns = ttk.Frame(self.dates_frame)
+        date_btns.pack(side="left", fill="y", padx=6, pady=6)
+        self.remove_btn = ttk.Button(date_btns, text="Remove",
+                                     command=self._remove_selected_dates)
+        self.remove_btn.pack(fill="x")
+        self.clear_dates_btn = ttk.Button(date_btns, text="Clear all",
+                                          command=self._clear_dates)
+        self.clear_dates_btn.pack(fill="x", pady=(4, 0))
 
         self.fetch_btn = ttk.Button(self.root, text="Fetch orders", command=self.on_fetch)
         self.fetch_btn.pack(fill="x", padx=10)
@@ -174,9 +213,12 @@ class PickerApp:
                                    command=self._open_workbook, state="disabled")
         self.open_btn.pack(fill="x", padx=10, pady=(4, 0))
 
-        self.status = tk.StringVar(value="Pick a date and click Fetch.")
+        self.status = tk.StringVar(value="Add up to 10 dates and click Fetch.")
         ttk.Label(self.root, textvariable=self.status, relief="sunken",
                   anchor="w").pack(fill="x", side="bottom")
+
+        # Start with yesterday listed so the everyday case stays a single click.
+        self._add_date(yesterday)
 
     # --- small helpers ----------------------------------------------------
     def _on_mousewheel(self, event) -> None:
@@ -196,34 +238,86 @@ class PickerApp:
         if self.workbook_url:
             webbrowser.open(self.workbook_url)
 
-    def _set_date(self, d: dt.date) -> None:
-        self.date_var.set(d.strftime("%m-%d-%Y"))
-
     def _set_all(self, value: bool) -> None:
         for var in self.check_vars.values():
             var.set(value)
 
     def _parse_date(self) -> dt.date:
-        return dt.datetime.strptime(self.date_var.get().strip(), "%m-%d-%Y").date()
+        return dt.datetime.strptime(self.date_var.get().strip(), DATE_FMT).date()
+
+    # --- the chosen-dates list --------------------------------------------
+    def _add_date(self, d: dt.date) -> bool:
+        """Add d to the list (no-op if already there). False if the list is full."""
+        if self.busy:
+            return False
+        if d in self.dates:
+            return True
+        if len(self.dates) >= MAX_DATES:
+            messagebox.showwarning(
+                "Too many dates",
+                f"You can pick up to {MAX_DATES} dates at a time. Remove one first.",
+                parent=self._cal_win if self._cal_win is not None else self.root,
+            )
+            return False
+        self.dates.append(d)
+        self.dates.sort()
+        self._refresh_dates()
+        return True
+
+    def _remove_date(self, d: dt.date) -> None:
+        if self.busy or d not in self.dates:
+            return
+        self.dates.remove(d)
+        self._refresh_dates()
+
+    def _add_typed_date(self) -> None:
+        try:
+            d = self._parse_date()
+        except ValueError:
+            messagebox.showerror("Bad date", "Please enter the date as MM-DD-YYYY.")
+            return
+        self._add_date(d)
+
+    def _remove_selected_dates(self) -> None:
+        if self.busy:
+            return
+        picked = {self.dates[i] for i in self.dates_list.curselection()}
+        if not picked:
+            return
+        self.dates = [d for d in self.dates if d not in picked]
+        self._refresh_dates()
+
+    def _clear_dates(self) -> None:
+        if self.busy:
+            return
+        self.dates.clear()
+        self._refresh_dates()
+
+    def _refresh_dates(self) -> None:
+        """Redraw the list box (and the open calendar's highlights) from self.dates."""
+        self.dates_list.delete(0, "end")
+        for d in self.dates:
+            self.dates_list.insert("end", f"{d:%a}  {d:%m-%d-%Y}")
+        self.dates_frame.config(text=f"Dates to fetch ({len(self.dates)}/{MAX_DATES})")
+        if self._cal_win is not None:
+            self._render_calendar()
 
     # --- calendar popup ---------------------------------------------------
     # A self-contained month grid in a plain Toplevel. We deliberately avoid any
     # focus grab (tkcalendar's grab is what wedges on macOS): the popup is just a
-    # window of buttons that closes when a day is clicked or the window is closed.
+    # window of buttons. Clicking a day adds it to the list (or removes it if it is
+    # already there); the popup stays open so several days can be picked in a row.
     def _open_calendar(self) -> None:
         if self.busy:
             return
         if self._cal_win is not None and self._cal_win.winfo_exists():
             self._cal_win.lift()
             return
-        try:
-            base = self._parse_date()
-        except ValueError:
-            base = dt.date.today()
+        base = self.dates[-1] if self.dates else dt.date.today()
         self._cal_view = (base.year, base.month)
 
         win = tk.Toplevel(self.root)
-        win.title("Pick a date")
+        win.title("Pick dates")
         win.transient(self.root)
         win.resizable(False, False)
         win.protocol("WM_DELETE_WINDOW", self._close_calendar)
@@ -242,11 +336,7 @@ class PickerApp:
         for child in win.winfo_children():
             child.destroy()
         year, month = self._cal_view
-
-        try:
-            selected = self._parse_date()
-        except ValueError:
-            selected = None
+        chosen = set(self.dates)
 
         hdr = ttk.Frame(win)
         hdr.pack(fill="x", padx=6, pady=6)
@@ -270,12 +360,18 @@ class PickerApp:
                 if day == 0:
                     continue
                 d = dt.date(year, month, day)
+                picked = d in chosen
                 btn = tk.Button(grid, text=str(day), width=2,
-                                relief=("sunken" if d == selected else "raised"),
-                                command=lambda dd=d: self._pick_day(dd))
-                if d == selected:
+                                relief=("sunken" if picked else "raised"),
+                                command=lambda dd=d: self._toggle_day(dd))
+                if picked:
                     btn.config(font=("TkDefaultFont", 0, "bold"))
                 btn.grid(row=r, column=c, padx=1, pady=1)
+
+        foot = ttk.Frame(win)
+        foot.pack(fill="x", padx=6, pady=(0, 8))
+        ttk.Label(foot, text=f"{len(self.dates)}/{MAX_DATES} picked").pack(side="left")
+        ttk.Button(foot, text="Done", command=self._close_calendar).pack(side="right")
 
     def _shift_month(self, delta: int) -> None:
         year, month = self._cal_view
@@ -287,9 +383,11 @@ class PickerApp:
         self._cal_view = (year, month)
         self._render_calendar()
 
-    def _pick_day(self, d: dt.date) -> None:
-        self._set_date(d)
-        self._close_calendar()
+    def _toggle_day(self, d: dt.date) -> None:
+        if d in self.dates:
+            self._remove_date(d)
+        else:
+            self._add_date(d)
 
     def _close_calendar(self) -> None:
         if self._cal_win is not None:
@@ -303,23 +401,35 @@ class PickerApp:
         for child in self.list_frame.winfo_children():
             child.destroy()
         self.check_vars.clear()
+        self.order_date.clear()
+        self.fetched.clear()
 
-    def _populate_orders(self, numbers: list[str]) -> None:
+    def _populate_orders(self, results: list[tuple[dt.date, list[str]]]) -> None:
+        """One bold heading per date, then a checkbox per order under it."""
         self._clear_orders()
-        for n in numbers:
-            var = tk.BooleanVar(value=False)
-            self.check_vars[n] = var
-            ttk.Checkbutton(self.list_frame, text=n, variable=var).pack(
-                anchor="w", padx=6, pady=1
-            )
+        for d, numbers in results:
+            self.fetched[d] = numbers
+            count = f"{len(numbers)} order(s)" if numbers else "no orders"
+            ttk.Label(self.list_frame, text=f"{d:%a %m-%d-%Y} — {count}",
+                      font=("TkDefaultFont", 0, "bold")).pack(
+                anchor="w", padx=6, pady=(6, 1))
+            for n in numbers:
+                var = tk.BooleanVar(value=False)
+                self.check_vars[n] = var
+                self.order_date[n] = d
+                ttk.Checkbutton(self.list_frame, text=n, variable=var).pack(
+                    anchor="w", padx=18, pady=1
+                )
 
     def _set_busy(self, busy: bool) -> None:
         """Disable inputs while a worker runs; re-enable order-dependent buttons after."""
         self.busy = busy
         ready = (not busy) and bool(self.check_vars)
-        self.fetch_btn.config(state="disabled" if busy else "normal")
-        self.date_entry.config(state="disabled" if busy else "normal")
-        self.cal_btn.config(state="disabled" if busy else "normal")
+        state = "disabled" if busy else "normal"
+        for widget in (self.fetch_btn, self.date_entry, self.add_btn, self.cal_btn,
+                       self.yesterday_btn, self.today_btn, self.remove_btn,
+                       self.clear_dates_btn, self.dates_list):
+            widget.config(state=state)
         if busy:
             self._close_calendar()
         for btn in (self.copy_btn, self.all_btn, self.none_btn):
@@ -327,24 +437,28 @@ class PickerApp:
 
     # --- actions ----------------------------------------------------------
     def on_fetch(self) -> None:
-        try:
-            target = self._parse_date()
-        except ValueError:
-            messagebox.showerror("Bad date", "Please enter the date as MM-DD-YYYY.")
+        if not self.dates:
+            messagebox.showinfo("No dates", "Add at least one date to fetch.")
             return
+        dates = list(self.dates)
         self._clear_orders()
-        self.fetched_date = None
         self._set_busy(True)
-        self.status.set(f"Opening TAP and filtering {target:%m-%d-%Y}…")
-        threading.Thread(target=self._fetch_worker, args=(target,), daemon=True).start()
+        self.status.set(f"Opening TAP to fetch {len(dates)} date(s)…")
+        threading.Thread(target=self._fetch_worker, args=(dates,), daemon=True).start()
 
-    def _fetch_worker(self, target: dt.date) -> None:
+    def _fetch_worker(self, dates: list[dt.date]) -> None:
         try:
+            results: list[tuple[dt.date, list[str]]] = []
             with chrome_session(DOWNLOADS, headless=HEADLESS) as page:
                 load_or_login(page, self.username, self.password, interactive=False)
-                expected = apply_filter(page, target)
-                numbers = list_order_numbers(page, expected_total=expected)
-            self.q.put(("orders", target, numbers))
+                # One filter per date rather than a single OR-ed query: the grid rows
+                # don't reliably say which day an order is from, and the copy step has
+                # to know that to write column F and to replace the right days.
+                for i, d in enumerate(dates, start=1):
+                    self.q.put(("status", f"Filtering {d:%m-%d-%Y} ({i}/{len(dates)})…"))
+                    expected = apply_filter(page, d)
+                    results.append((d, list_order_numbers(page, expected_total=expected)))
+            self.q.put(("orders", results))
         except MFARequiredError:
             self.q.put(("error", REAUTH_MESSAGE))
         except Exception as e:  # noqa: BLE001 — surfaced to the owner, logged in full
@@ -358,38 +472,73 @@ class PickerApp:
         if not selected:
             messagebox.showinfo("Nothing selected", "Tick at least one order to copy.")
             return
-        if self.fetched_date is None:
-            return
+        order_date = {n: self.order_date[n] for n in selected}
+        replace = sorted(set(order_date.values()))
+
+        # Replacing a date wipes ALL of its rows, so an order left unticked on a date
+        # that is being copied will not be in the sheet afterwards. That's the one
+        # surprising outcome, so it's the one we stop and ask about.
+        partial = [d for d in replace
+                   if any(not self.check_vars[n].get() for n in self.fetched.get(d, []))]
+        if partial:
+            days = "\n".join(f"   • {d:%a %m-%d-%Y}" for d in partial)
+            if not messagebox.askokcancel(
+                "Some orders are unticked",
+                "Copying replaces every row already in the sheet for these dates:\n\n"
+                f"{days}\n\n"
+                "Those dates have orders you didn't tick, and they won't be in the "
+                "sheet afterwards. Continue?",
+                icon="warning",
+            ):
+                return
+
         self._set_busy(True)
         self.status.set(f"Exporting {len(selected)} order(s)…")
         threading.Thread(
-            target=self._copy_worker, args=(self.fetched_date, selected), daemon=True
+            target=self._copy_worker, args=(order_date, replace), daemon=True
         ).start()
 
-    def _copy_worker(self, target: dt.date, selected: list[str]) -> None:
+    def _copy_worker(self, order_date: dict[str, dt.date], replace: list[dt.date]) -> None:
         try:
             clear_downloads()
-            only = set(selected)
+            only = set(order_date)
             batches: list[OrderBatch] = []
+            failed: list[str] = []
             with chrome_session(DOWNLOADS, headless=HEADLESS) as page:
                 load_or_login(page, self.username, self.password, interactive=False)
-                expected = apply_filter(page, target)
+                # All the dates in one query: (d1 OR d2 …) AND (status …).
+                expected = apply_filter(page, replace)
                 for handle in iter_orders(page, DOWNLOADS, only=only, expected_total=expected):
+                    day = order_date.get(handle.order_number)
+                    if day is None:
+                        # The detail page labelled it differently from the list; with
+                        # one date there is no doubt which day it is, otherwise there is.
+                        if len(replace) != 1:
+                            log.error("Exported %s, which wasn't in the list", handle.order_number)
+                            failed.append(handle.order_number)
+                            continue
+                        day = replace[0]
                     try:
                         rows = parse_ods(handle.ods_path)
-                    except Exception:  # noqa: BLE001 — one bad ODS shouldn't sink the rest
+                    except Exception:  # noqa: BLE001 — reported below, logged in full
                         log.exception("Failed to parse %s", handle.ods_path)
-                        self.q.put(("status", f"Skipped {handle.order_number}: parse error"))
+                        failed.append(handle.order_number)
                         continue
-                    batches.append(OrderBatch(handle.order_number, target, rows))
+                    batches.append(OrderBatch(handle.order_number, day, rows))
                     self.q.put(("status", f"Exported {handle.order_number} ({len(rows)} items)…"))
 
-            if not batches:
-                self.q.put(("error", "Nothing was exported — the selected orders had no items."))
+            # Replacing a date deletes its existing rows, so writing an incomplete set
+            # would quietly lose the orders that didn't come through. All or nothing.
+            missing = sorted(only - {b.order_number for b in batches})
+            if missing or failed:
+                bad = sorted(set(missing) | set(failed))
+                self.q.put(("error",
+                            "Couldn't export every ticked order, so the workbook was left "
+                            "unchanged:\n\n" + "\n".join(bad) + "\n\nTry Copy again."))
                 return
             self.q.put(("status", "Updating the workbook in OneDrive…"))
-            result = master_workbook.append(batches, BACKUPS)
-            self.q.put(("copied", result, len(selected)))
+            result = master_workbook.append(batches, BACKUPS, replace_dates=set(replace))
+            self.q.put(("copied", result, len(only), replace))
         except MFARequiredError:
             self.q.put(("error", REAUTH_MESSAGE))
         except GraphAuthRequiredError:
@@ -418,31 +567,38 @@ class PickerApp:
         if kind == "status":
             self.status.set(msg[1])
         elif kind == "orders":
-            _, target, numbers = msg
-            self.fetched_date = target
-            self._populate_orders(numbers)
+            results = msg[1]
+            self._populate_orders(results)
+            total = sum(len(numbers) for _, numbers in results)
             self.status.set(
-                f"Found {len(numbers)} order(s) for {target:%m-%d-%Y} — tick the ones to copy."
-                if numbers else f"No orders found for {target:%m-%d-%Y}."
+                f"Found {total} order(s) across {len(results)} date(s) — tick the ones to copy."
+                if total else f"No orders found for those {len(results)} date(s)."
             )
         elif kind == "workbook_url":
             self.workbook_url = msg[1]
             self.open_btn.config(state="normal")
         elif kind == "copied":
-            _, result, requested = msg
+            _, result, requested, replaced = msg
             if result.web_url:
                 self.workbook_url = result.web_url
                 self.open_btn.config(state="normal")
             skipped = requested - result.orders_added
-            if result.rows_added == 0:
-                self.status.set(f"Nothing new — all {requested} were already in the sheet.")
+            if result.rows_added == 0 and result.rows_removed == 0:
+                self.status.set("Nothing changed in the sheet.")
                 messagebox.showinfo(
-                    "Done", "Those orders were already in the sheet — nothing was added."
+                    "Done", "Those orders were already in the sheet — nothing was changed."
                 )
             else:
-                text = f"Added {result.rows_added} row(s) from {result.orders_added} order(s)."
+                days = ", ".join(f"{d:%m-%d}" for d in replaced)
+                text = f"Added {result.rows_added} row(s) from {result.orders_added} order(s)"
+                if result.rows_removed:
+                    text += (f", replacing {result.rows_removed} old row(s) dated "
+                             f"{days}.")
+                else:
+                    text += "."
                 if skipped:
-                    text += f"\n{skipped} were already in the sheet and skipped."
+                    text += (f"\n{skipped} order(s) were already in the sheet under "
+                             "another date, or had no items, and were skipped.")
                 self.status.set(text.replace("\n", "  "))
                 messagebox.showinfo("Done", text)
         elif kind == "error":

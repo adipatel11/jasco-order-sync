@@ -19,7 +19,7 @@ schedule.
 <p align="center">
   <img src="docs/picker.png" alt="The interactive order picker" width="430">
   <br>
-  <sub><i>The on-demand picker — choose a date, tick which orders to copy, one click to Excel. (Order numbers shown are placeholders.)</i></sub>
+  <sub><i>The on-demand picker — choose up to 10 dates, tick which orders to copy, one click to Excel. (Order numbers shown are placeholders.)</i></sub>
 </p>
 
 ## What it does
@@ -48,6 +48,9 @@ schedule.
    untouched.
 6. **Idempotent.** Orders whose number is already in column `E` are skipped, so re-runs
    (or overlap between the scheduled job and the manual picker) can never double-enter.
+   The picker goes one step further and **replaces** each date it copies: every row
+   already dated that day (column `F`) is deleted first — the rows below close up, with
+   their `VLOOKUP`s re-pointed at their new row — and the fresh export is appended.
 
 ## How it works
 
@@ -118,14 +121,19 @@ reliable enough to trust unattended:
 | | `run.py` — the daily job | `pick.py` — the picker |
 | --- | --- | --- |
 | **When** | Scheduled, unattended (systemd timer, midnight) | On demand, by hand |
-| **Scope** | *Every* order from *yesterday* | A date *you* choose, *orders you tick* |
+| **Scope** | *Every* order from *yesterday* | Up to 10 dates *you* choose, *orders you tick* |
 | **UI** | None (headless) | Tkinter window + double-click launcher |
 | **For** | Set-and-forget automation | The non-technical owner, no terminal needed |
 
-The picker lists a day's order numbers **without** exporting anything (a cheap
-enumeration), so the owner can eyeball them and tick only the ones they want before any
-download happens. Because the writer is idempotent, picking an order the daily job
-already captured is a safe no-op.
+The picker lists each chosen day's order numbers **without** exporting anything (a cheap
+enumeration, one filter per day so each order's date is certain), so the owner can
+eyeball them and tick only the ones they want before any download happens. Copying then
+filters all the ticked days in one query — `(submitted="…" OR submitted="…") AND
+(status=… OR status=…)` — exports the ticked orders, and **replaces** those days in the
+sheet: their existing rows are deleted and the fresh rows appended, so re-copying a day
+always leaves it matching TAP. If a day has orders left unticked, the picker asks first
+(they won't be in the sheet afterwards), and if any ticked order fails to export, the
+workbook is left untouched rather than half-replaced.
 
 ## Tech stack
 
@@ -145,7 +153,7 @@ already captured is a safe no-op.
 | File | Role |
 | ---- | ---- |
 | `run.py` | Daily entrypoint: yesterday → every order → append (unattended) |
-| `pick.py` | Interactive Tkinter picker: choose a date, pick which orders |
+| `pick.py` | Interactive Tkinter picker: choose up to 10 dates, pick which orders |
 | `tap_scraper.py` | Playwright driver: login, filter, list/iterate orders, export |
 | `ods_parser.py` | Reads rows from an exported ODS, drops the totals row |
 | `xlsx_writer.py` | Appends to the `Pending` sheet, dedupes, saves a timestamped backup |
@@ -226,8 +234,9 @@ master, all the other sheets come back and it should be trimmed again.**
 so the repo's `flock` can't keep them apart. Every upload carries the `eTag` of the copy
 it was based on; if the file changed underneath, Graph refuses with `412` and
 `master_workbook` re-downloads and replays the append. That's safe precisely because
-`write_orders` is idempotent — the replay re-skips whatever the other machine already
-wrote, so a lost update becomes a no-op rather than a duplicate.
+`write_orders` is idempotent — the replay re-replaces the picker's dates and re-skips
+whatever the other machine already wrote, so a lost update becomes a no-op rather than
+a duplicate.
 
 <details>
 <summary><b>One-time Microsoft app registration</b></summary>
@@ -378,8 +387,8 @@ on-demand picker, launched by double-clicking `Order Picker.bat`.
 5. **Establish the trusted device once** — the picker runs headless and can't do MFA
    itself, so run `python run.py` once from a terminal, complete the code, and tick
    **Trust this device**.
-6. **Everyday use:** double-click **`Order Picker.bat`** — no terminal needed. Pick a
-   date, **Fetch orders**, tick the ones to copy, **Copy selected → Excel**, then
+6. **Everyday use:** double-click **`Order Picker.bat`** — no terminal needed. Add the
+   dates you want (calendar, **+ Yesterday**/**+ Today**, or type one), **Fetch orders**, tick the ones to copy, **Copy selected → Excel**, then
    **Open workbook in browser** to see the result. Run `Create Desktop Shortcut.bat`
    once to drop a launcher icon on the Desktop.
 

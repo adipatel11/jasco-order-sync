@@ -11,6 +11,7 @@ is how you test a change without touching the real workbook.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import shutil
@@ -29,9 +30,9 @@ from xlsx_writer import OrderBatch, write_orders
 
 # run.py on the VPS and pick.py on a desktop are different machines, so the repo's
 # flock cannot keep them apart. If they collide, the loser's upload is refused on its
-# eTag and it starts over against the fresh copy. write_orders is idempotent and
-# append-only, so replaying it is safe — the retry simply re-skips whatever the
-# winner already wrote.
+# eTag and it starts over against the fresh copy. write_orders is idempotent (replace
+# the given dates, then append whatever isn't already there), so replaying it against
+# the fresh copy is safe — the retry simply re-skips whatever the winner already wrote.
 MAX_UPLOAD_ATTEMPTS = 3
 
 # A 423 means a person has the workbook open in Excel Online — likely, since the
@@ -50,6 +51,7 @@ class WriteResult:
     rows_added: int
     orders_added: int
     web_url: str | None  # the owner's bookmark, when the workbook is in OneDrive
+    rows_removed: int = 0  # rows deleted because their date was being replaced
 
 
 def in_cloud() -> bool:
@@ -97,17 +99,29 @@ def web_url() -> str | None:
         return None
 
 
-def append(batches: list[OrderBatch], backups_dir: Path) -> WriteResult:
-    """Append batches to the staging workbook and return what changed."""
+def append(
+    batches: list[OrderBatch],
+    backups_dir: Path,
+    replace_dates: set[dt.date] | None = None,
+) -> WriteResult:
+    """Append batches to the staging workbook and return what changed.
+
+    replace_dates: days whose existing rows are deleted first, so those days end up
+    holding exactly `batches` (see xlsx_writer.write_orders).
+    """
     if in_cloud():
-        return _append_cloud(batches, backups_dir)
+        return _append_cloud(batches, backups_dir, replace_dates)
 
     path = Path(os.environ["ORDER_XLSX_PATH"]).expanduser()
-    backup, rows, orders = write_orders(path, batches, backups_dir)
-    return WriteResult(backup, rows, orders, None)
+    backup, rows, orders, removed = write_orders(path, batches, backups_dir, replace_dates)
+    return WriteResult(backup, rows, orders, None, removed)
 
 
-def _append_cloud(batches: list[OrderBatch], backups_dir: Path) -> WriteResult:
+def _append_cloud(
+    batches: list[OrderBatch],
+    backups_dir: Path,
+    replace_dates: set[dt.date] | None,
+) -> WriteResult:
     ref = onedrive.resolve()
 
     for attempt in range(1, MAX_UPLOAD_ATTEMPTS + 1):
@@ -117,9 +131,11 @@ def _append_cloud(batches: list[OrderBatch], backups_dir: Path) -> WriteResult:
 
             # write_orders snapshots the pristine download into backups_dir before
             # saving, so the restore point captures the exact cloud state we edited.
-            backup, rows, orders = write_orders(local, batches, backups_dir)
-            if rows == 0:
-                # Nothing new — leave the cloud copy completely untouched.
+            backup, rows, orders, removed = write_orders(
+                local, batches, backups_dir, replace_dates
+            )
+            if rows == 0 and removed == 0:
+                # Nothing changed — leave the cloud copy completely untouched.
                 return WriteResult(None, 0, 0, ref.web_url)
 
             try:
@@ -150,7 +166,7 @@ def _append_cloud(batches: list[OrderBatch], backups_dir: Path) -> WriteResult:
                 # so our eTag is stale and the sheet may have new rows.
                 continue
 
-            return WriteResult(backup, rows, orders, ref.web_url)
+            return WriteResult(backup, rows, orders, ref.web_url, removed)
 
     raise WorkbookChangedError(f"Gave up after {MAX_UPLOAD_ATTEMPTS} attempts on {ref.name}")
 

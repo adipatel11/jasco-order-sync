@@ -10,6 +10,7 @@ and reuses it on every later run — so MFA's text-message step only happens onc
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import os
 import re
@@ -232,12 +233,17 @@ def _order_link_count(page: Page) -> int:
 
 
 def _wait_orders_stable(page: Page, *, differ_from: int | None = None,
+                        differ_numbers: list[str] | None = None,
                         timeout_ms: int = 20000) -> int:
     """Poll the order action-link (View/Invoice) count until it stops changing.
 
     The grid re-renders asynchronously after a filter/back-nav, so a single read can
     catch the stale list. If `differ_from` is given, first wait for the count to move
     off that value (the old list lingers for a moment after a filter is applied).
+
+    `differ_numbers` (the order numbers on screen before the filter) also counts as
+    "moved" once the visible numbers change. Without it, filtering one day after
+    another stalls the full timeout whenever both days fill page 1 to the same count.
     """
     deadline = time.time() + timeout_ms / 1000
     last: int | None = None
@@ -245,6 +251,9 @@ def _wait_orders_stable(page: Page, *, differ_from: int | None = None,
     while time.time() < deadline:
         n = _order_link_count(page)
         if differ_from is not None and n != differ_from:
+            moved = True
+        elif (not moved and differ_numbers is not None and n
+              and _current_page_numbers(page) != differ_numbers):
             moved = True
         if moved and n == last:
             return n
@@ -270,25 +279,43 @@ def _wait_for_orders(page: Page, minimum: int, timeout_ms: int = 15000) -> bool:
     return False
 
 
-def apply_filter(page: Page, target_date) -> int:
-    """Filter Retail Orders to a day's submitted Reserve Inventory / Shipped orders.
+def build_filter(dates) -> str:
+    """The Retail Orders filter for one day or several.
+
+    One day keeps the exact query the daily run has always used. Several days are
+    OR-ed inside their own parentheses, so the top-level operator is the AND with
+    the status clause:  (submitted="a" OR submitted="b") AND (status=… OR status=…).
+    """
+    if isinstance(dates, dt.date):
+        dates = [dates]
+    days = sorted(set(dates))
+    if not days:
+        raise ValueError("build_filter needs at least one date")
+    status = "(status='Reserve Inventory' OR status='Shipped')"
+    terms = [f'submitted="{d:%m-%d-%Y}"' for d in days]
+    if len(terms) == 1:
+        return f"{terms[0]} AND {status}"
+    return f"({' OR '.join(terms)}) AND {status}"
+
+
+def apply_filter(page: Page, dates) -> int:
+    """Filter Retail Orders to the submitted Reserve Inventory / Shipped orders of one
+    day (a date) or several (an iterable of dates).
 
     Returns the stabilised order count on page 1 — the authoritative "how many orders
     are there" number that callers pass back in so iteration/listing can wait for the
     grid to fully render before trusting it.
     """
-    date_str = target_date.strftime("%m-%d-%Y")
-    filter_text = (
-        f'submitted="{date_str}" '
-        "AND (status='Reserve Inventory' OR status='Shipped')"
-    )
+    filter_text = build_filter(dates)
+    log.info("Filter: %s", filter_text)
     before = _order_link_count(page)
+    before_numbers = _current_page_numbers(page)
     box = _filter_box(page)
     box.click()
     box.fill(filter_text)
     box.press("Enter")
     page.wait_for_load_state("networkidle")
-    n = _wait_orders_stable(page, differ_from=before)
+    n = _wait_orders_stable(page, differ_from=before, differ_numbers=before_numbers)
     log.info("Filter narrowed list from %d to %d orders (page 1)", before, n)
     return n
 
