@@ -142,16 +142,17 @@ class PickerApp:
         self.date_entry.bind("<Return>", lambda e: self._add_typed_date())
         self.add_btn = ttk.Button(top, text="Add", width=5, command=self._add_typed_date)
         self.add_btn.pack(side="left")
-        # Our own calendar popup (a plain Toplevel of buttons) — tkcalendar's
-        # drop-down is unusable on macOS, so we roll a small reliable one.
-        self.cal_btn = ttk.Button(top, text="Calendar…", command=self._open_calendar)
-        self.cal_btn.pack(side="left", padx=(6, 0))
 
+        # Its own row: on the top row next to the entry it got clipped to "Calenc".
         quick = ttk.Frame(self.root)
         quick.pack(fill="x", padx=10, pady=(0, 4))
+        # Our own calendar popup (a plain Toplevel of buttons) — tkcalendar's
+        # drop-down is unusable on macOS, so we roll a small reliable one.
+        self.cal_btn = ttk.Button(quick, text="Calendar…", command=self._open_calendar)
+        self.cal_btn.pack(side="left")
         self.yesterday_btn = ttk.Button(quick, text="+ Yesterday",
                                         command=lambda: self._add_date(yesterday))
-        self.yesterday_btn.pack(side="left")
+        self.yesterday_btn.pack(side="left", padx=(4, 0))
         self.today_btn = ttk.Button(quick, text="+ Today",
                                     command=lambda: self._add_date(dt.date.today()))
         self.today_btn.pack(side="left", padx=4)
