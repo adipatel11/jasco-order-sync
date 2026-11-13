@@ -6,9 +6,11 @@ chooses *which* orders get written to Order.xlsx, through a small Tkinter window
 
 Two phases, each a short self-contained browser session that reuses the persistent
 `.browser_profile` (so in normal use there is no re-login or MFA):
-  1. Fetch — filter each chosen date in turn and list its order numbers (no downloads
-     yet). One filter per date so every order's date is known for certain.
-  2. Copy  — filter all the ticked orders' dates at once ((d1 OR d2 …) AND status),
+  1. Fetch — filter each chosen date in turn to its orders that aren't canceled, and
+     list each order's number and status (no downloads yet). One filter per date so
+     every order's date is known for certain.
+  2. Copy  — filter all the ticked orders' dates at once
+     ((d1 OR d2 …) AND status<>'Canceled'),
      export only the ticked orders, parse them, and write them to Order.xlsx.
 
 Copying REPLACES a date: every row already in the sheet dated one of the ticked
@@ -44,7 +46,7 @@ from tap_scraper import (
     apply_filter,
     chrome_session,
     iter_orders,
-    list_order_numbers,
+    list_orders,
     load_or_login,
 )
 from xlsx_writer import OrderBatch
@@ -405,10 +407,11 @@ class PickerApp:
         self.order_date.clear()
         self.fetched.clear()
 
-    def _populate_orders(self, results: list[tuple[dt.date, list[str]]]) -> None:
-        """One bold heading per date, then a checkbox per order under it."""
+    def _populate_orders(self, results: list[tuple[dt.date, dict[str, str]]]) -> None:
+        """One bold heading per date, then a checkbox per order (number — status)."""
         self._clear_orders()
-        for d, numbers in results:
+        for d, orders in results:
+            numbers = list(orders)
             self.fetched[d] = numbers
             count = f"{len(numbers)} order(s)" if numbers else "no orders"
             ttk.Label(self.list_frame, text=f"{d:%a %m-%d-%Y} — {count}",
@@ -418,7 +421,8 @@ class PickerApp:
                 var = tk.BooleanVar(value=False)
                 self.check_vars[n] = var
                 self.order_date[n] = d
-                ttk.Checkbutton(self.list_frame, text=n, variable=var).pack(
+                label = f"{n}  —  {orders[n]}" if orders[n] else n
+                ttk.Checkbutton(self.list_frame, text=label, variable=var).pack(
                     anchor="w", padx=18, pady=1
                 )
 
@@ -449,7 +453,7 @@ class PickerApp:
 
     def _fetch_worker(self, dates: list[dt.date]) -> None:
         try:
-            results: list[tuple[dt.date, list[str]]] = []
+            results: list[tuple[dt.date, dict[str, str]]] = []
             with chrome_session(DOWNLOADS, headless=HEADLESS) as page:
                 load_or_login(page, self.username, self.password, interactive=False)
                 # One filter per date rather than a single OR-ed query: the grid rows
@@ -458,7 +462,7 @@ class PickerApp:
                 for i, d in enumerate(dates, start=1):
                     self.q.put(("status", f"Filtering {d:%m-%d-%Y} ({i}/{len(dates)})…"))
                     expected = apply_filter(page, d)
-                    results.append((d, list_order_numbers(page, expected_total=expected)))
+                    results.append((d, list_orders(page, expected_total=expected)))
             self.q.put(("orders", results))
         except MFARequiredError:
             self.q.put(("error", REAUTH_MESSAGE))
@@ -507,7 +511,7 @@ class PickerApp:
             failed: list[str] = []
             with chrome_session(DOWNLOADS, headless=HEADLESS) as page:
                 load_or_login(page, self.username, self.password, interactive=False)
-                # All the dates in one query: (d1 OR d2 …) AND (status …).
+                # All the dates in one query: (d1 OR d2 …) AND status<>'Canceled'.
                 expected = apply_filter(page, replace)
                 for handle in iter_orders(page, DOWNLOADS, only=only, expected_total=expected):
                     day = order_date.get(handle.order_number)

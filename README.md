@@ -27,7 +27,8 @@ schedule.
 1. **Logs into TAP.** A *persistent* browser profile stores the "Trust this device"
    cookie, so the SMS-MFA step only happens on the **first** run — every run after is
    credential-free and unattended.
-2. **Filters the order list** to a single day's submitted reserve-inventory orders.
+2. **Filters the order list** to a single day's submitted orders, every status except
+   canceled (`status<>'Canceled'`).
 3. **Walks every matching order:** opens it, clicks Export (which fires an `.ods`
    download via a popup), and recovers the order number from the detail page.
 4. **Appends the line items** to the `Pending` sheet of `Order.xlsx` — which lives in
@@ -125,11 +126,11 @@ reliable enough to trust unattended:
 | **UI** | None (headless) | Tkinter window + double-click launcher |
 | **For** | Set-and-forget automation | The non-technical owner, no terminal needed |
 
-The picker lists each chosen day's order numbers **without** exporting anything (a cheap
+The picker lists each chosen day's order numbers, each with its TAP status, **without** exporting anything (a cheap
 enumeration, one filter per day so each order's date is certain), so the owner can
 eyeball them and tick only the ones they want before any download happens. Copying then
 filters all the ticked days in one query — `(submitted="…" OR submitted="…") AND
-(status=… OR status=…)` — exports the ticked orders, and **replaces** those days in the
+status<>'Canceled'` — exports the ticked orders, and **replaces** those days in the
 sheet: their existing rows are deleted and the fresh rows appended, so re-copying a day
 always leaves it matching TAP. If a day has orders left unticked, the picker asks first
 (they won't be in the sheet afterwards), and if any ticked order fails to export, the

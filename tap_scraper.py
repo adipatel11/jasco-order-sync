@@ -50,6 +50,19 @@ ORDER_ACTION_RE = re.compile(r"^(View|Invoice)$")
 # the Invoice path may word it differently, so we match any "Go back to …".
 GO_BACK_RE = re.compile(r"^Go back to\b")
 
+# Every order the day brought in, whatever state it's in — except canceled ones.
+STATUS_FILTER = "status<>'Canceled'"
+
+# Used only if the grid's "Status" column header can't be located: a row cell whose
+# whole text is one of these is taken as the status. Purely cosmetic (the picker's
+# label), so a miss just leaves the status blank.
+KNOWN_STATUS_RE = re.compile(
+    r"^(Reserve Inventory|Shipped|Partially Shipped|Submitted|Pending|Approved|"
+    r"In Process|Processing|Received|Returned|Denied|Rejected|On Hold|Back ?Ordered|"
+    r"Completed?|Closed|Open)$",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class OrderHandle:
@@ -280,18 +293,19 @@ def _wait_for_orders(page: Page, minimum: int, timeout_ms: int = 15000) -> bool:
 
 
 def build_filter(dates) -> str:
-    """The Retail Orders filter for one day or several.
+    """The Retail Orders filter for one day or several: every order that isn't canceled.
 
-    One day keeps the exact query the daily run has always used. Several days are
-    OR-ed inside their own parentheses, so the top-level operator is the AND with
-    the status clause:  (submitted="a" OR submitted="b") AND (status=… OR status=…).
+    TAP's filter negates with `<>`, so  status<>'Canceled'  keeps every status but that
+    one. One day reads  submitted="a" AND status<>'Canceled'. Several days are OR-ed
+    inside their own parentheses, so the top-level operator is the AND with the status
+    clause:  (submitted="a" OR submitted="b") AND status<>'Canceled'.
     """
     if isinstance(dates, dt.date):
         dates = [dates]
     days = sorted(set(dates))
     if not days:
         raise ValueError("build_filter needs at least one date")
-    status = "(status='Reserve Inventory' OR status='Shipped')"
+    status = STATUS_FILTER
     terms = [f'submitted="{d:%m-%d-%Y}"' for d in days]
     if len(terms) == 1:
         return f"{terms[0]} AND {status}"
@@ -299,8 +313,8 @@ def build_filter(dates) -> str:
 
 
 def apply_filter(page: Page, dates) -> int:
-    """Filter Retail Orders to the submitted Reserve Inventory / Shipped orders of one
-    day (a date) or several (an iterable of dates).
+    """Filter Retail Orders to the submitted, not-canceled orders of one day (a date)
+    or several (an iterable of dates).
 
     Returns the stabilised order count on page 1 — the authoritative "how many orders
     are there" number that callers pass back in so iteration/listing can wait for the
@@ -326,15 +340,62 @@ def apply_filter(page: Page, dates) -> int:
 # SAME row. The list reshuffles its row order every time we enter and leave an order, so
 # we always select by order number, never by position.
 
+# One pass over the grid in the browser: each row's text and cell texts, plus the
+# text of the cell sitting under the "Status" column header. The header is matched by
+# on-screen position rather than DOM structure, so it works whether the grid draws
+# its header in the same <table> as the rows or in a separate frozen-header table.
+_ROWS_JS = """
+() => {
+  const norm = s => (s || "").replace(/\\s+/g, " ").trim();
+  const rows = [...document.querySelectorAll("tr.TDR")];
+  let hx = null;
+  if (rows.length) {
+    const top = rows[0].getBoundingClientRect().top;
+    const heads = [...document.querySelectorAll("th, td, div, span, a, label")]
+      .filter(e => /^(order )?status$/i.test(norm(e.textContent)))
+      .map(e => e.getBoundingClientRect())
+      .filter(r => r.width > 0 && r.bottom <= top + 2);
+    if (heads.length) {
+      heads.sort((a, b) => b.bottom - a.bottom);   // the header nearest the rows
+      hx = (heads[0].left + heads[0].right) / 2;
+    }
+  }
+  return rows.map(tr => {
+    const cells = [...tr.cells];
+    let status = "";
+    if (hx !== null) {
+      const c = cells.find(c => {
+        const r = c.getBoundingClientRect();
+        return r.left <= hx && hx <= r.right;
+      });
+      if (c) status = norm(c.innerText);
+    }
+    return { text: tr.innerText || "", cells: cells.map(c => norm(c.innerText)), status };
+  });
+}
+"""
+
+
+def _current_page_orders(page: Page) -> list[tuple[str, str]]:
+    """(order number, status) for each order on the current list page, in DOM order.
+
+    The status is "" if it can't be read — it's only shown to the owner, never acted on.
+    """
+    orders: list[tuple[str, str]] = []
+    for row in page.evaluate(_ROWS_JS):
+        m = ORDER_NUMBER_RE.search(row["text"])
+        if not m:
+            continue
+        status = row["status"]
+        if not status or ORDER_NUMBER_RE.fullmatch(status):
+            status = next((c for c in row["cells"] if KNOWN_STATUS_RE.match(c)), "")
+        orders.append((m.group(0), status))
+    return orders
+
+
 def _current_page_numbers(page: Page) -> list[str]:
     """Order numbers (e.g. R3144144) visible on the current list page, in DOM order."""
-    rows = page.locator("tr.TDR")
-    numbers: list[str] = []
-    for i in range(rows.count()):
-        m = ORDER_NUMBER_RE.search(rows.nth(i).inner_text())
-        if m:
-            numbers.append(m.group(0))
-    return numbers
+    return [n for n, _ in _current_page_orders(page)]
 
 
 def _click_order_action(page: Page, order_number: str) -> bool:
@@ -381,13 +442,14 @@ def _goto_first_page(page: Page) -> None:
             return
 
 
-def list_order_numbers(page: Page, expected_total: int | None = None) -> list[str]:
-    """Enumerate order numbers across all list pages WITHOUT entering/exporting them.
+def list_orders(page: Page, expected_total: int | None = None) -> dict[str, str]:
+    """Enumerate orders across all list pages WITHOUT entering/exporting them.
 
-    The interactive picker uses this to show the day's orders cheaply so the owner can
-    choose which to export — exporting every order just to pick a couple would be slow.
-    Reuses the same row scraping and pagination as iter_orders; order is preserved and
-    duplicates (a number that re-appears after the list reshuffles) are collapsed.
+    Returns {order number: status}, in list order. The interactive picker uses this to
+    show the day's orders (and what state each is in) cheaply so the owner can choose
+    which to export — exporting every order just to pick a couple would be slow.
+    Reuses the same row scraping and pagination as iter_orders; duplicates (a number
+    that re-appears after the list reshuffles) are collapsed.
 
     `expected_total` (the post-filter count from apply_filter) makes us wait for the grid
     to finish rendering before scanning, so we never show a short list by mistake.
@@ -395,16 +457,19 @@ def list_order_numbers(page: Page, expected_total: int | None = None) -> list[st
     _goto_first_page(page)
     if expected_total:
         _wait_for_orders(page, expected_total)
-    seen: set[str] = set()
-    ordered: list[str] = []
+    found: dict[str, str] = {}
     while True:
-        for n in _current_page_numbers(page):
-            if n not in seen:
-                seen.add(n)
-                ordered.append(n)
+        for n, status in _current_page_orders(page):
+            if not found.get(n):
+                found[n] = status
         if not _goto_next_page(page):
             break
-    return ordered
+    return found
+
+
+def list_order_numbers(page: Page, expected_total: int | None = None) -> list[str]:
+    """Just the order numbers from list_orders, in list order."""
+    return list(list_orders(page, expected_total=expected_total))
 
 
 def _extract_order_number(download: Download, page: Page) -> str:
