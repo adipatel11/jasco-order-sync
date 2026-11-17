@@ -203,23 +203,58 @@ def _go_to_orders(page: Page) -> None:
             log.info("Account link %r not shown (attempt %d, url=%s)",
                      name, attempt, page.url)
 
-        orders = page.get_by_role("link", name="Add/View Retail Orders")
-        try:
-            orders.first.wait_for(state="visible", timeout=10000)
-            orders.first.click()
-            page.wait_for_load_state("networkidle")
-            log.info("Clicked Add/View Retail Orders; now at %s", page.url)
-        except PWTimeout:
-            log.warning("Add/View Retail Orders link not found (attempt %d, url=%s)",
-                        attempt, page.url)
-
-        if _orders_list_ready(page, timeout=15000):
+        if _click_until(page, "Add/View Retail Orders",
+                        lambda: _filter_box(page).is_visible()):
             return
 
         log.warning("Orders list not ready (attempt %d, url=%s); resetting", attempt, page.url)
         page.goto(TAP_URL, wait_until="domcontentloaded")
 
     raise RuntimeError(f"Could not reach the Retail Orders list (url={page.url})")
+
+
+def _click_until(page: Page, link_name: str, arrived, *, settle_s: float = 10,
+                 patience_s: float = 30, clicks: int = 3) -> bool:
+    """Click the link named `link_name` until `arrived()` is true. True on arrival.
+
+    TAP silently drops a click that lands while the SPA is still settling from the
+    previous navigation: the link is visible, Playwright's click succeeds, and the
+    page just stays put (measured: 120 s with no change), so waiting longer never
+    helps. Clicking again does. So every click is verified by its destination, and
+    re-issued if the link we clicked is still sitting there after `settle_s`.
+
+    If the link HAS gone (we navigated) but the destination is still rendering, keep
+    waiting up to `patience_s` instead of clicking something on the new page.
+    """
+    link = page.get_by_role("link", name=link_name).first
+    try:
+        link.wait_for(state="visible", timeout=10000)
+    except PWTimeout:
+        log.warning("Link %r not found (url=%s)", link_name, page.url)
+        return False
+
+    for n in range(1, clicks + 1):
+        link.click()
+        log.info("Clicked %r (click %d); now at %s", link_name, n, page.url)
+        start = time.monotonic()
+        while True:
+            if arrived():
+                return True
+            elapsed = time.monotonic() - start
+            try:
+                still_here = link.is_visible()
+            except Exception:
+                still_here = False
+            if elapsed >= (settle_s if still_here else patience_s):
+                break
+            page.wait_for_timeout(250)
+        if not still_here:
+            log.warning("Left the page via %r but its destination never rendered "
+                        "(url=%s)", link_name, page.url)
+            return False
+        log.warning("Click %d on %r was ignored (still on the same page after "
+                    "%.0f s); clicking again", n, link_name, settle_s)
+    return False
 
 
 def load_or_login(page: Page, username: str, password: str, interactive: bool = True) -> None:
